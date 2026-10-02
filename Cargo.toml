@@ -1,0 +1,33 @@
+[package]
+name = "makeport"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "A small desktop launcher for remote Make tasks and SSH tunnels"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "makeport"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+gui = ["dep:slint", "dep:slint-build"]
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+toml = "=0.8.23"
+directories = "=6.0.0"
+tempfile = "=3.23.0"
+fs2 = "=0.4.3"
+slint = { version = "=1.17.1", optional = true, default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "accessibility"] }
+
+[build-dependencies]
+slint-build = { version = "=1.17.1", optional = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

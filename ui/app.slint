@@ -1,0 +1,582 @@
+import { Button, CheckBox, LineEdit, ScrollView, TextEdit, Palette } from "std-widgets.slint";
+
+export struct ProjectItem { title: string, host: string }
+export struct TaskItem {
+    name: string, title: string, description: string, state: string,
+    active: bool, can-run: bool, can-stop: bool, unknown: bool,
+}
+export struct PortItem { local: int, mapping: string, detail: string }
+
+component Heading inherits Text {
+    font-size: 15px;
+    font-weight: 600;
+    color: Palette.foreground;
+}
+
+export component MainWindow inherits Window {
+    title: "MakePort";
+    preferred-width: 1060px;
+    preferred-height: 800px;
+    min-width: 920px;
+    min-height: 720px;
+    default-font-size: 14px;
+    background: Palette.background;
+
+    in property <[ProjectItem]> projects;
+    in property <[TaskItem]> tasks;
+    in property <[PortItem]> ports;
+    in property <int> selected: -1;
+    in property <string> project-name;
+    in property <string> project-location;
+    in property <string> connection: "Загрузка…";
+    in property <bool> connected;
+    in property <bool> desired;
+    in property <bool> can-change;
+    in property <bool> can-connect;
+    in property <int> running;
+    in property <string> next-action;
+    in property <bool> discovering;
+    in-out property <bool> show-log: false;
+    in-out property <bool> show-manual: false;
+    in-out property <bool> show-help: false;
+    in-out property <string> task-filter;
+    callback filter-tasks(string);
+    in property <string> log-name;
+    in property <string> log-text;
+    in-out property <string> notice;
+    in property <bool> fatal;
+    in property <bool> quitting;
+    in property <string> mono-font: "monospace";
+
+    in-out property <bool> editing: false;
+    in-out property <string> edit-id;
+    in property <bool> edit-is-new;
+    in-out property <string> edit-name;
+    in-out property <string> edit-host;
+    in-out property <string> edit-user;
+    in-out property <int> edit-step: 0;
+    in-out property <bool> edit-advanced: false;
+    in-out property <string> edit-error;
+    in property <[PortItem]> edit-port-list;
+    in-out property <string> port-remote;
+    in-out property <string> port-local;
+    callback next-step();
+    callback add-port(string, string);
+    callback remove-port(int);
+    in-out property <string> edit-path;
+    in-out property <string> edit-ports;
+    in-out property <string> edit-tasks;
+    in-out property <bool> edit-reconnect: true;
+    in-out property <string> confirm-kind;
+    in-out property <string> confirm-target;
+    in-out property <bool> follow-log: true;
+    private property <bool> interactive: !root.editing && !root.show-help && root.confirm-kind == "" && !root.quitting;
+
+    callback select-project(int);
+    callback new-project();
+    callback edit-project();
+    callback save-project(bool);
+    callback delete-project();
+    callback toggle-connection();
+    callback refresh-tasks();
+    callback run-target(string);
+    callback stop-target(string);
+    callback reset-target(string);
+    callback select-log(string);
+    callback clear-log();
+    callback open-port(int);
+    callback open-config();
+    callback dismiss-notice();
+    callback quit();
+    callback scroll-log();
+
+    scroll-log => {
+        if (root.follow-log) {
+            output.viewport-y = min(0px, output.height - output.viewport-height - 16px);
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 0px;
+        Rectangle {
+            width: 204px;
+            background: Palette.alternate-background;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 14px;
+                Heading { text: "MakePort"; font-size: 24px; height: 38px; }
+                Text { text: "ПРОЕКТЫ"; font-size: 11px; color: Palette.alternate-foreground; height: 20px; }
+                ScrollView {
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 6px;
+                        for project[index] in root.projects: Button {
+                            text: project.title;
+                            height: 44px;
+                            checkable: true;
+                            checked: index == root.selected;
+                            enabled: root.can-change && root.interactive;
+                            clicked => { root.select-project(index); }
+                        }
+                        Rectangle { vertical-stretch: 1; }
+                    }
+                }
+                Button {
+                    text: "+ Добавить проект";
+                    height: 36px;
+                    enabled: root.can-change && root.interactive;
+                    clicked => { root.new-project(); }
+                }
+                Button {
+                    text: "Помощь";
+                    height: 32px;
+                    enabled: root.interactive;
+                    clicked => { root.show-help = true; }
+                }
+                Text {
+                    text: "Проекты на ваших серверах";
+                    color: Palette.alternate-foreground;
+                    font-size: 11px;
+                    height: 20px;
+                }
+            }
+        }
+        Rectangle { width: 1px; background: Palette.border; }
+        ScrollView {
+        VerticalLayout {
+            padding: 18px;
+            spacing: 8px;
+            HorizontalLayout {
+                height: 56px;
+                spacing: 12px;
+                VerticalLayout {
+                    spacing: 6px;
+                    Heading {
+                        text: root.selected < 0 ? "Ваш проект — в одном окне" : root.project-name;
+                        font-size: 24px;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.selected < 0 ? "Запускайте задачи и открывайте приложения с удалённого сервера." : root.project-location;
+                        font-size: 12px;
+                        color: Palette.foreground;
+                        overflow: elide;
+                    }
+                }
+                Button {
+                    text: "Настроить";
+                    enabled: root.selected >= 0 && root.can-change && root.interactive;
+                    clicked => { root.edit-project(); }
+                }
+                Button {
+                    text: root.desired ? (root.connected ? "Отключиться" : "Отменить подключение") : "Подключиться";
+                    primary: !root.desired;
+                    enabled: root.can-connect && root.interactive;
+                    clicked => {
+                        if (root.desired && root.running > 0) { root.confirm-kind = "disconnect"; }
+                        else { root.toggle-connection(); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                height: 24px;
+                spacing: 8px;
+                Rectangle {
+                    width: 8px; height: 8px; border-radius: 4px;
+                    background: root.connected ? #2d9b68 : #989ba3;
+                }
+                Text { text: root.connection; color: Palette.foreground; font-size: 12px; }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: root.running > 0 ? "Работает задач: " + root.running : ""; color: Palette.foreground; font-size: 12px; }
+            }
+            if !root.show-log: Rectangle {
+                min-height: 64px;
+                border-radius: 8px;
+                background: Palette.alternate-background;
+                HorizontalLayout {
+                    padding: 14px; spacing: 12px;
+                    Text { text: root.next-action; wrap: word-wrap; color: Palette.foreground; font-size: 13px; }
+                    if root.selected < 0: Button {
+                        text: "Добавить первый проект"; primary: true;
+                        enabled: root.can-change && root.interactive;
+                        clicked => { root.new-project(); }
+                    }
+                }
+            }
+            if !root.can-change && root.selected >= 0 && !root.quitting && !root.show-log: Text {
+                text: root.running > 0 ? "Чтобы сменить проект или настройки, сначала остановите задачи и отключитесь." : "Настройки доступны после отключения и проверки неподтверждённых задач.";
+                color: Palette.foreground; font-size: 11px; wrap: word-wrap;
+            }
+            if root.notice != "": Rectangle {
+                min-height: 66px;
+                max-height: 96px;
+                border-width: 1px;
+                border-color: #c79a37;
+                border-radius: 6px;
+                HorizontalLayout {
+                    padding: 10px;
+                    spacing: 12px;
+                    Text { text: root.notice; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                    Button {
+                        text: "Подробности"; enabled: root.interactive;
+                        clicked => { root.show-log = true; root.select-log(""); }
+                    }
+                    Button {
+                        text: "Скрыть";
+                        enabled: !root.fatal && root.interactive;
+                        clicked => { root.dismiss-notice(); }
+                    }
+                }
+            }
+            Heading { text: "Открыть приложение"; height: 22px; }
+            Rectangle {
+                height: root.ports.length == 0 ? 44px : (root.show-log ? 64px : 100px);
+                border-width: 1px;
+                border-color: Palette.border;
+                border-radius: 6px;
+                if root.ports.length == 0: Text {
+                    x: 12px; y: 12px;
+                    text: "Для доступа к сайту добавьте порт приложения в настройках проекта.";
+                    color: Palette.foreground;
+                    font-size: 12px;
+                }
+                if root.ports.length > 0: ScrollView {
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 4px;
+                        for port in root.ports: HorizontalLayout {
+                            height: 34px;
+                            spacing: 12px;
+                            VerticalLayout {
+                                Text { text: port.mapping; color: Palette.foreground; font-size: 14px; }
+                                Text { text: port.detail; color: Palette.foreground; font-size: 11px; }
+                            }
+                            Text { text: root.connected ? "Доступ подключён" : "Нужно подключиться"; color: Palette.foreground; font-size: 11px; }
+                            Button {
+                                text: "В браузере";
+                                enabled: root.connected && root.interactive;
+                                clicked => { root.open-port(port.local); }
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalLayout {
+                height: 30px;
+                Heading { text: "Задачи проекта"; }
+                Rectangle { horizontal-stretch: 1; }
+                Button {
+                    text: root.discovering ? "Обновляем…" : "Обновить список";
+                    enabled: root.connected && !root.discovering && root.interactive;
+                    clicked => { root.refresh-tasks(); }
+                }
+            }
+            if root.selected >= 0: LineEdit {
+                placeholder-text: "Найти задачу по названию или команде";
+                text <=> root.task-filter;
+                enabled: root.interactive;
+                edited => { root.filter-tasks(self.text); }
+            }
+            Rectangle {
+                min-height: root.show-log ? 100px : 140px;
+                vertical-stretch: 1;
+                border-width: 1px;
+                border-color: Palette.border;
+                border-radius: 6px;
+                if root.tasks.length == 0: Text {
+                    x: 14px; y: 16px; width: parent.width - 28px;
+                    text: root.task-filter != "" ? "Нет задач с таким названием. Попробуйте другой запрос." : root.discovering ? "Загружаем задачи проекта…" : root.connected ? "В проекте не найден список задач. Попросите автора проекта добавить описания задач в Makefile или откройте «Другую задачу»." : "Подключитесь к проекту — доступные задачи появятся здесь.";
+                    wrap: word-wrap;
+                    color: Palette.foreground;
+                    font-size: 13px;
+                }
+                if root.tasks.length > 0: ScrollView {
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 4px;
+                        for task in root.tasks: Rectangle {
+                            height: 76px;
+                            border-radius: 4px;
+                            background: task.name == root.log-name ? Palette.alternate-background : Palette.background;
+                            HorizontalLayout {
+                                padding: 8px;
+                                spacing: 8px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 4px;
+                                    Heading { text: task.title; font-size: 15px; overflow: elide; }
+                                    Text { text: task.description; font-size: 11px; color: Palette.foreground; overflow: elide; }
+                                }
+                                Text {
+                                    text: task.state;
+                                    width: 150px;
+                                    color: task.unknown ? #c79030 : Palette.foreground;
+                                    font-size: 12px;
+                                }
+                                Button { text: "Подробности"; height: 36px; enabled: root.interactive; clicked => { root.show-log = true; root.select-log(task.name); } }
+                                if task.unknown: Button {
+                                    text: "Разобраться";
+                                    enabled: root.interactive;
+                                    clicked => { root.confirm-target = task.name; root.confirm-kind = "reset"; }
+                                }
+                                if !task.unknown: Button {
+                                    text: task.active ? "Остановить" : "Запустить";
+                                    primary: !task.active;
+                                    height: 36px;
+                                    enabled: root.interactive && (task.active ? task.can-stop : task.can-run);
+                                    clicked => {
+                                        if (task.active) { root.stop-target(task.name); }
+                                        else { root.run-target(task.name); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalLayout {
+                height: 32px;
+                Button { text: root.show-manual ? "Скрыть другую задачу" : "Другая задача…"; enabled: root.selected >= 0 && root.interactive; clicked => { root.show-manual = !root.show-manual; } }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: root.show-log ? "Скрыть подробности" : "Показать подробности"; enabled: root.interactive; clicked => { root.show-log = !root.show-log; } }
+            }
+            if root.show-manual: Text { text: "Введите имя задачи из Makefile. Если вы его не знаете, уточните у автора проекта."; color: Palette.foreground; font-size: 12px; wrap: word-wrap; }
+            if root.show-manual: HorizontalLayout {
+                height: 34px;
+                spacing: 8px;
+                manual := LineEdit {
+                    placeholder-text: "Другая цель, например dev";
+                    enabled: root.can-connect && (!root.desired || root.connected) && root.interactive;
+                    accepted => { if (self.text != "") { root.run-target(self.text); } }
+                }
+                Button {
+                    text: "Запустить";
+                    enabled: manual.text != "" && manual.enabled;
+                    clicked => { root.run-target(manual.text); }
+                }
+            }
+            if root.show-log: HorizontalLayout {
+                height: 28px;
+                spacing: 10px;
+                Heading { text: root.log-name == "" ? "Подключение · подробности" : "Результат · " + root.log-name; }
+                Rectangle { horizontal-stretch: 1; }
+                CheckBox { text: "Последние сообщения"; checked <=> root.follow-log; enabled: root.interactive; }
+                Button { text: "Подключение"; enabled: root.interactive; clicked => { root.select-log(""); } }
+                Button {
+                    text: "Копировать";
+                    enabled: root.interactive;
+                    clicked => { output.select-all(); output.copy(); output.clear-selection(); }
+                }
+                Button { text: "Очистить"; enabled: root.interactive; clicked => { root.clear-log(); } }
+            }
+            output := TextEdit {
+                text: root.log-text;
+                height: root.show-log ? 120px : 0px;
+                visible: root.show-log;
+                read-only: true;
+                wrap: no-wrap;
+                font-family: root.mono-font;
+                font-size: 12px;
+                enabled: root.interactive;
+            }
+        }
+    }
+
+    }
+
+    if root.editing: Rectangle {
+        background: #00000066;
+        TouchArea { }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 660px; height: min(680px, parent.height - 32px);
+            border-radius: 12px;
+            background: Palette.background;
+            VerticalLayout {
+                padding: 24px; spacing: 14px;
+                Heading { text: root.edit-is-new ? "Добавить проект" : "Настройки проекта"; font-size: 24px; height: 34px; }
+                HorizontalLayout {
+                    height: 32px; spacing: 10px;
+                    Text { text: "1  Сервер"; color: root.edit-step == 0 ? Palette.accent-background : Palette.foreground; font-weight: root.edit-step == 0 ? 700 : 400; }
+                    Text { text: "→"; color: Palette.foreground; }
+                    Text { text: "2  Проект"; color: root.edit-step == 1 ? Palette.accent-background : Palette.foreground; font-weight: root.edit-step == 1 ? 700 : 400; }
+                    Text { text: "→"; color: Palette.foreground; }
+                    Text { text: "3  Приложения"; color: root.edit-step == 2 ? Palette.accent-background : Palette.foreground; font-weight: root.edit-step == 2 ? 700 : 400; }
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 12px; padding-right: 8px;
+                        if root.edit-step == 0: VerticalLayout {
+                            spacing: 12px;
+                            Heading { text: "На каком сервере находится проект?"; font-size: 18px; }
+                            Text { text: "Используйте данные от администратора или автора проекта."; wrap: word-wrap; color: Palette.foreground; }
+                            Text { text: "Название проекта"; color: Palette.foreground; }
+                            LineEdit { text <=> root.edit-name; placeholder-text: "Например, Мой сайт"; }
+                            Text { text: "Адрес сервера или сохранённое подключение"; color: Palette.foreground; }
+                            LineEdit { text <=> root.edit-host; placeholder-text: "Например, server.example.com или devbox"; }
+                            Text { text: "Имя пользователя на сервере (если нужно)"; color: Palette.foreground; }
+                            LineEdit { text <=> root.edit-user; placeholder-text: "Например, developer"; }
+                            Rectangle {
+                                min-height: 108px; background: Palette.alternate-background; border-radius: 8px;
+                                VerticalLayout {
+                                    padding: 14px; spacing: 8px;
+                                    Heading { text: "Доступ по SSH должен быть настроен"; }
+                                    Text { text: "Приложение использует ключи доступа этого компьютера. Если вы раньше не подключались к серверу, попросите администратора настроить вход и подтвердить ключ сервера. Пароль в MakePort вводить не нужно."; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                }
+                            }
+                        }
+                        if root.edit-step == 1: VerticalLayout {
+                            spacing: 12px;
+                            Heading { text: "Где лежит проект?"; font-size: 18px; }
+                            Text { text: "Нужна папка на сервере, в которой находится Makefile со списком задач. Уточните путь у автора проекта."; wrap: word-wrap; color: Palette.foreground; }
+                            Text { text: "Путь к папке на сервере"; color: Palette.foreground; }
+                            LineEdit { text <=> root.edit-path; placeholder-text: "Например, ~/projects/site или /srv/site"; }
+                            Text { text: "~/ означает домашнюю папку пользователя на сервере. Путь на вашем компьютере здесь не подходит."; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                            CheckBox { text: "Восстанавливать подключение при потере связи"; checked <=> root.edit-reconnect; }
+                            Button { text: root.edit-advanced ? "Скрыть дополнительные задачи" : "Дополнительные задачи…"; clicked => { root.edit-advanced = !root.edit-advanced; } }
+                            if root.edit-advanced: VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "Если автор проекта дал вам имена задач, которых нет в списке, добавьте их через запятую."; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                LineEdit { text <=> root.edit-tasks; placeholder-text: "Например, dev, test, build"; }
+                            }
+                        }
+                        if root.edit-step == 2: VerticalLayout {
+                            spacing: 12px;
+                            Heading { text: "Что вы хотите открыть на этом компьютере?"; font-size: 18px; }
+                            Text { text: "Добавьте номер порта приложения, который сообщил автор проекта. Для задач без сайта этот шаг можно пропустить."; wrap: word-wrap; color: Palette.foreground; }
+                            HorizontalLayout {
+                                spacing: 12px;
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    Text { text: "Порт приложения на сервере"; color: Palette.foreground; font-size: 12px; }
+                                    LineEdit { text <=> root.port-remote; placeholder-text: "Например, 5173"; }
+                                }
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    Text { text: "На этом компьютере (необязательно)"; color: Palette.foreground; font-size: 12px; }
+                                    LineEdit { text <=> root.port-local; placeholder-text: "Такой же, как на сервере"; }
+                                }
+                            }
+                            Button { text: "Добавить доступ"; enabled: root.port-remote != ""; clicked => { root.add-port(root.port-local, root.port-remote); } }
+                            Text { text: "Если адрес уже занят, выберите другой номер для этого компьютера. Допустимые номера: от 1 до 65535."; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                            for port in root.edit-port-list: Rectangle {
+                                height: 60px; background: Palette.alternate-background; border-radius: 8px;
+                                HorizontalLayout {
+                                    padding: 10px; spacing: 12px;
+                                    VerticalLayout {
+                                        Text { text: port.mapping; color: Palette.foreground; font-weight: 600; }
+                                        Text { text: port.detail; color: Palette.foreground; font-size: 11px; }
+                                    }
+                                    Button { text: "Убрать"; clicked => { root.remove-port(port.local); } }
+                                }
+                            }
+                            Text { text: "После подключения сначала запустите задачу приложения, затем нажмите «В браузере». Доступ к порту сам по себе не запускает приложение."; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                        }
+                        Rectangle { vertical-stretch: 1; }
+                    }
+                }
+                if root.edit-error != "" || root.notice != "": Text {
+                    text: root.edit-error != "" ? root.edit-error : root.notice;
+                    wrap: word-wrap; color: #b37413; font-size: 12px; min-height: 32px;
+                }
+                HorizontalLayout {
+                    spacing: 8px; height: 38px;
+                    Button { text: "Отмена"; clicked => { root.editing = false; } }
+                    if !root.edit-is-new: Button { text: "Удалить проект…"; clicked => { root.confirm-kind = "delete"; } }
+                    Rectangle { horizontal-stretch: 1; }
+                    if root.edit-step > 0: Button { text: "Назад"; clicked => { root.edit-step -= 1; root.edit-error = ""; } }
+                    if root.edit-step < 2: Button { text: "Далее"; primary: true; clicked => { root.next-step(); } }
+                    if root.edit-step == 2 && root.edit-is-new: Button { text: "Сохранить"; clicked => { root.save-project(false); } }
+                    if root.edit-step == 2: Button { text: root.edit-is-new ? "Подключиться" : "Сохранить"; primary: true; clicked => { root.save-project(root.edit-is-new); } }
+                }
+            }
+        }
+    }
+
+    if root.show-help: Rectangle {
+        background: #00000066;
+        TouchArea { }
+        Rectangle {
+            width: 640px; height: 510px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            border-radius: 12px; background: Palette.background;
+            VerticalLayout {
+                padding: 26px; spacing: 16px;
+                Heading { text: "Как начать работу"; font-size: 24px; }
+                Text { text: "1. Попросите автора проекта дать адрес сервера, имя пользователя, путь к папке и порты приложений."; color: Palette.foreground; wrap: word-wrap; }
+                Text { text: "2. Администратор должен настроить вход по SSH с этого компьютера. Для незнакомого сервера нужно проверить его ключ."; color: Palette.foreground; wrap: word-wrap; }
+                Text { text: "3. Добавьте проект и подключитесь. Задачи из Makefile появятся автоматически."; color: Palette.foreground; wrap: word-wrap; }
+                Text { text: "4. Нажмите «Запустить» у нужной задачи. Для сайта затем нажмите «В браузере» в разделе приложений."; color: Palette.foreground; wrap: word-wrap; }
+                Text { text: "Если появилась ошибка, откройте подробности и скопируйте сообщения для администратора. При неизвестном состоянии задачи не запускайте её повторно до проверки."; color: Palette.foreground; wrap: word-wrap; font-size: 12px; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    Button { text: "Файлы настроек"; clicked => { root.open-config(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "Понятно"; primary: true; clicked => { root.show-help = false; } }
+                }
+            }
+        }
+    }
+
+    if root.confirm-kind != "": Rectangle {
+        background: #00000066;
+        TouchArea { }
+        Rectangle {
+            width: 520px; height: 252px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 10px;
+            background: Palette.background;
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+                Heading {
+                    text: root.confirm-kind == "delete" ? "Удалить настройки проекта?" : root.confirm-kind == "reset" ? "Можно ли запускать задачу снова?" : "Завершить работу задач?";
+                    font-size: 19px;
+                }
+                Text {
+                    text: root.confirm-kind == "delete" ? "Удалится только запись из MakePort. Файлы на сервере останутся на месте." : root.confirm-kind == "reset" ? "Связь с задачей потеряна. Попросите администратора проверить, завершилась ли она на сервере. Если запустить её сейчас, могут работать две копии. Подтверждайте только после проверки." : "Запущенные задачи получат Ctrl+C, затем SSH-туннели будут закрыты. Завершение отделившихся фоновых процессов не гарантируется.";
+                    wrap: word-wrap;
+                    color: Palette.foreground;
+                    vertical-stretch: 1;
+                }
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "Отмена"; clicked => { root.confirm-kind = ""; } }
+                    Button {
+                        text: root.confirm-kind == "reset" ? "Задача завершена, проверено" : root.confirm-kind == "delete" ? "Удалить проект" : root.confirm-kind == "quit" ? "Остановить и выйти" : "Остановить и отключиться";
+                        primary: true;
+                        clicked => {
+                            if (root.confirm-kind == "quit") { root.quit(); }
+                            if (root.confirm-kind == "disconnect") { root.toggle-connection(); }
+                            if (root.confirm-kind == "delete") { root.delete-project(); }
+                            if (root.confirm-kind == "reset") { root.reset-target(root.confirm-target); }
+                            root.confirm-kind = "";
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.quitting: Rectangle {
+        background: #00000088;
+        TouchArea { }
+        Rectangle {
+            width: 460px; height: 112px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 8px;
+            background: Palette.background;
+            VerticalLayout {
+                padding: 22px;
+                spacing: 12px;
+                Heading { text: "Закрытие соединений…"; }
+                Text { text: "Ожидание завершения задач и SSH."; color: Palette.foreground; }
+            }
+        }
+    }
+}

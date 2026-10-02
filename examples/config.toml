@@ -1,0 +1,19 @@
+version = 1
+selected = "demo"
+unconfirmed = []
+
+[[projects]]
+id = "demo"
+name = "Мой сайт"
+host = "devbox"
+path = "~/projects/site"
+reconnect = true
+tasks = ["dev", "test", "build"]
+
+[[projects.ports]]
+local = 5173
+remote = 5173
+
+[[projects.ports]]
+local = 15432
+remote = 5432

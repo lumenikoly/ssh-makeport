@@ -1,0 +1,29 @@
+test_piped_ctrl_c_is_delivered_to_remote_pty (test_fake_ssh.FakeSSHTests.test_piped_ctrl_c_is_delivered_to_remote_pty) ... ok
+test_port_conflict_never_reports_ready (test_fake_ssh.FakeSSHTests.test_port_conflict_never_reports_ready) ... ok
+test_real_tcp_forwarding_and_shutdown (test_fake_ssh.FakeSSHTests.test_real_tcp_forwarding_and_shutdown) ... ok
+test_linux_package_contains_binary_and_license (test_packaging.PackagingTests.test_linux_package_contains_binary_and_license) ... ok
+test_macos_bundle_structure_without_signing (test_packaging.PackagingTests.test_macos_bundle_structure_without_signing) ... ok
+test_missing_binary_is_an_error (test_packaging.PackagingTests.test_missing_binary_is_an_error) ... ok
+test_windows_package_uses_exe_extension (test_packaging.PackagingTests.test_windows_package_uses_exe_extension) ... ok
+test_all_scripts_have_valid_posix_syntax (test_remote.ShellTests.test_all_scripts_have_valid_posix_syntax) ... ok
+test_connection_reports_ready_after_preflight (test_remote.ShellTests.test_connection_reports_ready_after_preflight) ... ok
+test_connection_stays_alive_until_stdin_eof (test_remote.ShellTests.test_connection_stays_alive_until_stdin_eof) ... ok
+test_ctrl_c_reaches_make_and_its_child (test_remote.ShellTests.test_ctrl_c_reaches_make_and_its_child) ... /usr/lib/python3.13/pty.py:95: DeprecationWarning: This process (pid=1198) is multi-threaded, use of forkpty() may lead to deadlocks in the child.
+  pid, fd = os.forkpty()
+ok
+test_discovery_reads_makefile_without_evaluating_it (test_remote.ShellTests.test_discovery_reads_makefile_without_evaluating_it) ... ok
+test_discovery_size_is_bounded (test_remote.ShellTests.test_discovery_size_is_bounded) ... ok
+test_discovery_uses_gnu_filename_precedence (test_remote.ShellTests.test_discovery_uses_gnu_filename_precedence) ... ok
+test_failure_is_acknowledged_with_nonzero_code (test_remote.ShellTests.test_failure_is_acknowledged_with_nonzero_code) ... ok
+test_home_expansion_is_explicit (test_remote.ShellTests.test_home_expansion_is_explicit) ... ok
+test_invalid_directory_never_reports_ready (test_remote.ShellTests.test_invalid_directory_never_reports_ready) ... ok
+test_missing_makefile_is_explicit (test_remote.ShellTests.test_missing_makefile_is_explicit) ... ok
+test_nested_remote_shell_quoting_is_literal (test_remote.ShellTests.test_nested_remote_shell_quoting_is_literal) ... ok
+test_relative_directory_is_rejected (test_remote.ShellTests.test_relative_directory_is_rejected) ... ok
+test_success_is_acknowledged (test_remote.ShellTests.test_success_is_acknowledged) ... ok
+test_task_requires_a_real_pty (test_remote.ShellTests.test_task_requires_a_real_pty) ... ok
+
+----------------------------------------------------------------------
+Ran 22 tests in 4.606s
+
+OK
