@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New release tag matching Cargo.toml (for example v0.1.0)'
+        required: true
+        default: v0.1.0
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: '12.0'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate release tag and source
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "Run releases from main." >&2; exit 1; }
+          python scripts/release.py validate "$RELEASE_TAG"
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "Tag $RELEASE_TAG already exists. Use a new version." >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows
+            arch: x86_64
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+          - os: macos-15
+            platform: macos
+            arch: arm64
+          - os: macos-15-intel
+            platform: macos
+            arch: x86_64
+    name: Build ${{ matrix.platform }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Test application and offline integration
+        run: cargo test --all-targets --locked
+      - name: Test shell, PTY, packaging and release helpers
+        if: runner.os != 'Windows'
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Test packaging and release helpers on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m unittest discover -s tests -p 'test_packaging.py' -v
+          python -m unittest discover -s tests -p 'test_release.py' -v
+      - name: Check all targets
+        run: cargo clippy --all-targets --locked
+      - name: Build desktop application
+        run: cargo build --release --locked
+      - name: Sign macOS executable locally
+        if: runner.os == 'macOS'
+        run: /usr/bin/codesign --force --sign - target/release/makeport
+      - name: Collect executable
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/release.py collect "$RELEASE_TAG" "$PLATFORM" "$ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify asset set and create checksums
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: python scripts/release.py checksums "$RELEASE_TAG"
+      - name: Publish GitHub Release and create tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG"; then
+            echo "Tag $RELEASE_TAG was created during the build. Refusing to publish." >&2
+            exit 1
+          else
+            status=$?
+            [[ "$status" == 2 ]] || exit "$status"
+          fi
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --target "$RELEASE_SHA" \
+            --title "MakePort $RELEASE_TAG" \
+            --generate-notes

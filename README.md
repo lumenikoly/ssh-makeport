@@ -300,6 +300,44 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 Windows/Linux собираются под архитектуру исполнителя; macOS также под архитектуру
 выбранного исполнителя, не универсальный бинарный файл.
 
+## Ручной выпуск релиза
+
+Workflow **Release** в `.github/workflows/release.yml` запускается только вручную,
+как в [JexFold](https://github.com/lumenikoly/JexFold/blob/main/.github/workflows/release.yml).
+Введите **новый** тег вида `v0.1.0`. Сборка выполняется из `main`; тег создаётся
+после успешной сборки всех платформ. Существующий тег не пересобирается и не перезаписывается.
+
+1. Укажите нужную версию в `Cargo.toml`, обновите `Cargo.lock` командой
+   `cargo check --no-default-features` и отправьте изменения в `main`.
+2. На GitHub откройте **Actions → Release → Run workflow**.
+3. Выберите ветку **main**, введите тег, например `v0.1.0`, и нажмите **Run workflow**.
+4. После успешного выполнения готовые файлы появятся в **Releases**.
+
+Для версии `v0.1.0` публикуются непосредственно исполняемые файлы, без ZIP и `.app`:
+
+| Файл | Платформа |
+|---|---|
+| `MakePort-v0.1.0-windows-x86_64.exe` | Windows x64 |
+| `MakePort-v0.1.0-linux-x86_64` | Linux x64 |
+| `MakePort-v0.1.0-macos-arm64` | Mac с Apple Silicon |
+| `MakePort-v0.1.0-macos-x86_64` | Mac с Intel |
+
+Также прикладывается `SHA256SUMS`. На Linux/macOS после скачивания бинарника
+дайте ему право запуска и запустите из терминала, например на Apple Silicon:
+
+```sh
+chmod +x MakePort-v0.1.0-macos-arm64
+./MakePort-v0.1.0-macos-arm64
+```
+
+Mac-бинарники имеют локальную подпись, без Developer ID и нотарификации Apple.
+Обычная упаковка через `scripts/package.py` остаётся отдельным локальным сценарием.
+
+Все платформы собираются из одного зафиксированного коммита. Публикация запускается
+только после проверок и сборок Windows, Linux и обеих архитектур macOS.
+Версия тега должна совпадать с `Cargo.toml` и записью MakePort в `Cargo.lock`.
+Рабочий процесс использует штатный `GITHUB_TOKEN`; отдельный PAT не требуется.
+
 ## Структура
 
 ```text

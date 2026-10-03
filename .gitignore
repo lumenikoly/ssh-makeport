@@ -1,5 +1,6 @@
 /target/
 /dist/
+/release-assets/
 __pycache__/
 *.pyc
 .DS_Store
