@@ -1,30 +1,54 @@
 use crate::model::{validate_target, Project};
 use crate::Result;
 
+pub const CONFIG_SCRIPT: &str = include_str!("../remote/config.sh");
+
 pub const CONNECT_SCRIPT: &str = include_str!("../remote/connect.sh");
 pub const DISCOVER_SCRIPT: &str = include_str!("../remote/discover.sh");
 pub const TASK_SCRIPT: &str = include_str!("../remote/task.sh");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Role { Tunnel, Discover, Task(String) }
+pub enum Role {
+    Tunnel,
+    Config,
+    Discover,
+    Task(String),
+}
 
 pub fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub fn ready_marker(token: &str) -> String { format!("__MAKEPORT_READY_{token}__") }
-pub fn started_marker(token: &str) -> String { format!("__MAKEPORT_STARTED_{token}__") }
-pub fn exit_marker(token: &str) -> String { format!("__MAKEPORT_EXIT_{token}__:") }
+pub fn ready_marker(token: &str) -> String {
+    format!("__MAKEPORT_READY_{token}__")
+}
+pub fn started_marker(token: &str) -> String {
+    format!("__MAKEPORT_STARTED_{token}__")
+}
+pub fn exit_marker(token: &str) -> String {
+    format!("__MAKEPORT_EXIT_{token}__:")
+}
 
 pub fn remote_command(project: &Project, role: &Role, token: &str) -> Result<String> {
     project.validate()?;
     let script = match role {
         Role::Tunnel => CONNECT_SCRIPT,
+        Role::Config => CONFIG_SCRIPT,
         Role::Discover => DISCOVER_SCRIPT,
-        Role::Task(target) => { validate_target(target)?; TASK_SCRIPT }
+        Role::Task(target) => {
+            validate_target(target)?;
+            TASK_SCRIPT
+        }
     };
-    let mut command = format!("sh -c {} makeport {} {}", quote(script), quote(&project.path), quote(token));
-    if let Role::Task(target) = role { command.push_str(&format!(" {}", quote(target))); }
+    let mut command = format!(
+        "sh -c {} makeport {} {}",
+        quote(script),
+        quote(&project.path),
+        quote(token)
+    );
+    if let Role::Task(target) = role {
+        command.push_str(&format!(" {}", quote(target)));
+    }
     Ok(command)
 }
 
@@ -33,12 +57,25 @@ pub fn arguments(project: &Project, role: &Role, token: &str) -> Result<Vec<Stri
     // Session ownership is independent of ~/.ssh/config ControlMaster settings.
     // No interactive password dialogs and no implicit trust of new host keys.
     for option in [
-        "BatchMode=yes", "StrictHostKeyChecking=yes", "ConnectTimeout=10",
-        "ConnectionAttempts=1", "ServerAliveInterval=15", "ServerAliveCountMax=3",
-        "ControlMaster=no", "ControlPath=none", "ControlPersist=no",
-        "ExitOnForwardFailure=yes", "ForwardAgent=no", "ForwardX11=no",
-        "PermitLocalCommand=no", "RemoteCommand=none", "ForkAfterAuthentication=no",
-        "StdinNull=no", "SessionType=default", "EscapeChar=none", "LogLevel=ERROR",
+        "BatchMode=yes",
+        "StrictHostKeyChecking=yes",
+        "ConnectTimeout=10",
+        "ConnectionAttempts=1",
+        "ServerAliveInterval=15",
+        "ServerAliveCountMax=3",
+        "ControlMaster=no",
+        "ControlPath=none",
+        "ControlPersist=no",
+        "ExitOnForwardFailure=yes",
+        "ForwardAgent=no",
+        "ForwardX11=no",
+        "PermitLocalCommand=no",
+        "RemoteCommand=none",
+        "ForkAfterAuthentication=no",
+        "StdinNull=no",
+        "SessionType=default",
+        "EscapeChar=none",
+        "LogLevel=ERROR",
     ] {
         args.push("-o".into());
         args.push(option.into());
@@ -46,9 +83,13 @@ pub fn arguments(project: &Project, role: &Role, token: &str) -> Result<Vec<Stri
     match role {
         Role::Tunnel => {
             args.extend(["-T".into(), "-o".into(), "ClearAllForwardings=no".into()]);
-            for port in &project.ports { args.extend(["-L".into(), port.argument()]); }
+            for port in &project.ports {
+                args.extend(["-L".into(), port.argument()]);
+            }
         }
-        Role::Discover => args.extend(["-T".into(), "-o".into(), "ClearAllForwardings=yes".into()]),
+        Role::Config | Role::Discover => {
+            args.extend(["-T".into(), "-o".into(), "ClearAllForwardings=yes".into()])
+        }
         Role::Task(_) => args.extend(["-tt".into(), "-o".into(), "ClearAllForwardings=yes".into()]),
     }
     args.push(project.host.clone());
@@ -61,7 +102,18 @@ mod tests {
     use super::*;
     use crate::model::Forward;
     fn project() -> Project {
-        Project { id: "a".into(), name: "test".into(), host: "dev".into(), path: "~/my ' project".into(), ports: vec![Forward { local: 5173, remote: 80 }], tasks: Vec::new(), reconnect: true }
+        Project {
+            id: "a".into(),
+            name: "test".into(),
+            host: "dev".into(),
+            path: "~/my ' project".into(),
+            ports: vec![Forward {
+                local: 5173,
+                remote: 80,
+            }],
+            tasks: Vec::new(),
+            reconnect: true,
+        }
     }
     #[test]
     fn quotes_single_quotes_and_leaves_expansion_literal() {

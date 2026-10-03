@@ -6,6 +6,7 @@ pub mod makefile;
 pub mod model;
 pub mod platform;
 pub mod process;
+pub mod project_file;
 pub mod shell;
 pub mod store;
 

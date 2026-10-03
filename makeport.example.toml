@@ -1,0 +1,16 @@
+[[ports]]
+remote = 5173
+description = "Сайт для просмотра"
+
+[[ports]]
+remote = 5432
+local = 15432
+description = "База данных"
+
+[[tasks]]
+target = "dev"
+description = "Запустить сайт"
+
+[[tasks]]
+target = "test"
+description = "Проверить проект"

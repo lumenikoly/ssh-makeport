@@ -2,7 +2,7 @@
 #![deny(unsafe_code)]
 
 use makeport::engine::{self, Action, View};
-use makeport::model::{parse_ports, unique_id, validate_host, validate_path, Draft, Forward};
+use makeport::model::{unique_id, Draft};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,42 +16,23 @@ mod generated {
 }
 use generated::*;
 
-fn port_items(ports: &[Forward]) -> ModelRc<PortItem> {
-    ModelRc::new(VecModel::from(
-        ports
-            .iter()
-            .map(|p| PortItem {
-                local: i32::from(p.local),
-                mapping: format!("localhost:{}", p.local).into(),
-                detail: format!("Приложение на сервере: порт {}", p.remote).into(),
-            })
-            .collect::<Vec<_>>(),
-    ))
-}
-
-fn update_edit_ports(ui: &MainWindow, ports: Vec<Forward>) {
-    ui.set_edit_ports(
-        ports
-            .iter()
-            .map(|p| format!("{}:{}", p.local, p.remote))
-            .collect::<Vec<_>>()
-            .join(", ")
-            .into(),
-    );
-    ui.set_edit_port_list(port_items(&ports));
-}
-
 fn draft(ui: &MainWindow) -> Draft {
     let host = ui.get_edit_host().trim().to_owned();
-    let user = ui.get_edit_user().trim().to_owned();
     Draft {
         id: ui.get_edit_id().to_string(),
-        name: ui.get_edit_name().to_string(),
-        host: if user.is_empty() {
-            host
+        name: if ui.get_edit_name().trim().is_empty() {
+            ui.get_edit_path()
+                .trim()
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|p| !p.is_empty() && *p != "~")
+                .unwrap_or(&host)
+                .to_owned()
         } else {
-            format!("{user}@{host}")
+            ui.get_edit_name().to_string()
         },
+        host,
         path: ui.get_edit_path().to_string(),
         ports: ui.get_edit_ports().to_string(),
         tasks: ui.get_edit_tasks().to_string(),
@@ -60,15 +41,9 @@ fn draft(ui: &MainWindow) -> Draft {
 }
 
 fn update_tasks(ui: &MainWindow, view: &View) {
-    let query = ui.get_task_filter().trim().to_lowercase();
     ui.set_tasks(ModelRc::new(VecModel::from(
         view.tasks
             .iter()
-            .filter(|t| {
-                query.is_empty()
-                    || t.title.to_lowercase().contains(&query)
-                    || t.name.to_lowercase().contains(&query)
-            })
             .map(|t| TaskItem {
                 name: t.name.clone().into(),
                 description: t.description.clone().into(),
@@ -95,24 +70,24 @@ fn edit(ui: &MainWindow, draft: Draft) {
     ui.set_edit_is_new(is_new);
     ui.set_edit_id(if is_new { unique_id() } else { draft.id }.into());
     ui.set_edit_name(draft.name.into());
-    let (user, host) = draft.host.split_once('@').unwrap_or(("", &draft.host));
-    ui.set_edit_user(user.into());
-    ui.set_edit_host(host.into());
+    ui.set_edit_host(draft.host.into());
     ui.set_edit_path(draft.path.into());
-    update_edit_ports(ui, parse_ports(&draft.ports).unwrap_or_default());
+    ui.set_edit_ports(draft.ports.into());
     ui.set_edit_tasks(draft.tasks.into());
     ui.set_edit_reconnect(draft.reconnect);
-    ui.set_edit_step(0);
-    ui.set_edit_advanced(false);
     ui.set_edit_error("".into());
-    ui.set_port_remote("".into());
-    ui.set_port_local("".into());
     ui.set_editing(true);
 }
 
 fn apply(ui: &MainWindow, view: &View, previous: &View) {
     // Keep models stable while only logs change. This preserves focus/scrolling.
     if view.projects != previous.projects {
+        ui.set_project_titles(ModelRc::new(VecModel::from(
+            view.projects
+                .iter()
+                .map(|p| SharedString::from(p.name.clone()))
+                .collect::<Vec<_>>(),
+        )));
         ui.set_projects(ModelRc::new(VecModel::from(
             view.projects
                 .iter()
@@ -143,11 +118,23 @@ fn apply(ui: &MainWindow, view: &View, previous: &View) {
     ui.set_notice(view.notice.clone().into());
     ui.set_fatal(view.fatal);
     ui.set_quitting(view.quitting);
-    if view.ports != previous.ports {
-        ui.set_ports(port_items(&view.ports));
-    }
-    if view.selected != previous.selected {
-        ui.set_task_filter("".into());
+    if view.ports != previous.ports || view.port_descriptions != previous.port_descriptions {
+        ui.set_ports(ModelRc::new(VecModel::from(
+            view.ports
+                .iter()
+                .enumerate()
+                .map(|(i, p)| PortItem {
+                    local: i32::from(p.local),
+                    mapping: format!("localhost:{} → сервер:{}", p.local, p.remote).into(),
+                    detail: view
+                        .port_descriptions
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("Порт {}", p.remote))
+                        .into(),
+                })
+                .collect::<Vec<_>>(),
+        )));
     }
     if view.tasks != previous.tasks || view.selected != previous.selected {
         update_tasks(ui, view);
@@ -162,74 +149,6 @@ fn apply(ui: &MainWindow, view: &View, previous: &View) {
     }
     if view.quit_ready {
         let _ = slint::quit_event_loop();
-    }
-}
-
-fn bind_editor(ui: &MainWindow) {
-    {
-        let weak = ui.as_weak();
-        ui.on_next_step(move || {
-            if let Some(ui) = weak.upgrade() {
-                let d = draft(&ui);
-                let result = if ui.get_edit_step() == 0 {
-                    if d.name.trim().is_empty() {
-                        Err("Назовите проект, чтобы легко найти его в списке.".into())
-                    } else {
-                        validate_host(&d.host)
-                    }
-                } else {
-                    validate_path(d.path.trim())
-                };
-                match result {
-                    Ok(()) => {
-                        ui.set_edit_error("".into());
-                        ui.set_edit_step(ui.get_edit_step() + 1);
-                    }
-                    Err(error) => ui.set_edit_error(error.into()),
-                }
-            }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        ui.on_add_port(move |local: SharedString, remote: SharedString| {
-            if let Some(ui) = weak.upgrade() {
-                let remote = remote.trim();
-                let local = if local.trim().is_empty() {
-                    remote
-                } else {
-                    local.trim()
-                };
-                let mut existing = ui.get_edit_ports().to_string();
-                if !existing.is_empty() {
-                    existing.push(',');
-                }
-                existing.push_str(&format!("{local}:{remote}"));
-                match parse_ports(&existing) {
-                    Ok(ports) => {
-                        update_edit_ports(&ui, ports);
-                        ui.set_edit_error("".into());
-                        ui.set_port_remote("".into());
-                        ui.set_port_local("".into());
-                    }
-                    Err(error) => ui.set_edit_error(error.into()),
-                }
-            }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        ui.on_remove_port(move |local| {
-            if let Some(ui) = weak.upgrade() {
-                let ports = parse_ports(&ui.get_edit_ports())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|p| i32::from(p.local) != local)
-                    .collect();
-                update_edit_ports(&ui, ports);
-                ui.set_edit_error("".into());
-            }
-        });
     }
 }
 
@@ -280,18 +199,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     action_string!(on_stop_target, Action::Stop);
     action_string!(on_reset_target, Action::Reset);
     action_string!(on_select_log, Action::SelectLog);
-
-    {
-        let weak = ui.as_weak();
-        let state = state.clone();
-        ui.on_filter_tasks(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                update_tasks(&ui, &state.borrow());
-            }
-        });
-    }
-
-    bind_editor(&ui);
 
     {
         let weak = ui.as_weak();
@@ -362,14 +269,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tx = backend.actions.clone();
         ui.on_save_project(move |connect| {
             if let Some(ui) = weak.upgrade() {
-                if !ui.get_port_remote().trim().is_empty() || !ui.get_port_local().trim().is_empty()
-                {
-                    ui.set_edit_error(
-                        "Нажмите «Добавить доступ» или очистите поля портов перед сохранением."
-                            .into(),
-                    );
-                    return;
-                }
                 let draft = draft(&ui);
                 match draft.clone().into_project() {
                     Ok(_) => {
@@ -466,67 +365,46 @@ mod tests {
     }
 
     #[test]
-    fn wizard_validates_steps_and_keeps_port_edits_and_search_consistent() {
+    fn folder_form_and_config_descriptions_reach_the_ui() {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
         slint::platform::set_platform(Box::new(TestPlatform(window))).unwrap();
         let ui = MainWindow::new().unwrap();
-        bind_editor(&ui);
         edit(&ui, Draft::default());
-        ui.invoke_next_step();
-        assert_eq!(ui.get_edit_step(), 0);
-        assert!(ui.get_edit_error().contains("Назовите проект"));
-        ui.set_edit_name("Сайт".into());
-        ui.set_edit_host("devbox".into());
-        ui.set_edit_user("developer".into());
-        ui.invoke_next_step();
-        assert_eq!(ui.get_edit_step(), 1);
-        ui.set_edit_path("relative/path".into());
-        ui.invoke_next_step();
-        assert_eq!(ui.get_edit_step(), 1);
-        assert!(!ui.get_edit_error().is_empty());
+        assert!(draft(&ui).into_project().is_err());
+        ui.set_edit_host("developer@devbox".into());
         ui.set_edit_path("~/projects/site".into());
-        ui.invoke_next_step();
-        assert_eq!(ui.get_edit_step(), 2);
-        ui.invoke_add_port("".into(), "5173".into());
-        ui.invoke_add_port("15432".into(), "5432".into());
-        assert_eq!(ui.get_edit_port_list().row_count(), 2);
-        ui.invoke_add_port("5173".into(), "80".into());
-        assert!(ui.get_edit_error().contains("дважды"));
-        assert_eq!(ui.get_edit_port_list().row_count(), 2);
-        ui.invoke_add_port("".into(), "65536".into());
-        assert_eq!(ui.get_edit_port_list().row_count(), 2);
-        ui.invoke_remove_port(5173);
         let project = draft(&ui).into_project().unwrap();
-        assert_eq!(project.host, "developer@devbox");
-        assert_eq!(
-            project.ports,
-            vec![Forward {
-                local: 15432,
-                remote: 5432
-            }]
-        );
+        assert_eq!(project.name, "site");
         edit(&ui, Draft::from(&project));
         assert_eq!(draft(&ui).into_project().unwrap(), project);
         let view = View {
+            projects: vec![project],
+            selected: Some(0),
+            connected: true,
+            ports: vec![makeport::model::Forward {
+                local: 5173,
+                remote: 80,
+            }],
+            port_descriptions: vec!["Сайт клиента".into()],
             tasks: vec![engine::TaskView {
-                name: "test".into(),
-                description: "Команда: test".into(),
-                title: "Проверить проект".into(),
-                state: "Готова".into(),
-                active: false,
-                can_run: true,
-                can_stop: false,
+                name: "dev".into(),
+                description: "Команда: dev".into(),
+                title: "Запустить сайт клиента".into(),
+                state: "Работает".into(),
+                active: true,
+                can_run: false,
+                can_stop: true,
                 unknown: false,
             }],
             ..View::default()
         };
-        for query in ["ПРОВЕРИТЬ", "test"] {
-            ui.set_task_filter(query.into());
-            update_tasks(&ui, &view);
-            assert_eq!(ui.get_tasks().row_count(), 1);
-        }
-        ui.set_task_filter("missing".into());
-        update_tasks(&ui, &view);
-        assert_eq!(ui.get_tasks().row_count(), 0);
+        apply(&ui, &view, &View::default());
+        assert_eq!(ui.get_ports().row_data(0).unwrap().detail, "Сайт клиента");
+        assert_eq!(
+            ui.get_tasks().row_data(0).unwrap().title,
+            "Запустить сайт клиента"
+        );
+        assert_eq!(ui.get_tasks().row_data(0).unwrap().state, "Работает");
+        assert!(!ui.get_show_log());
     }
 }

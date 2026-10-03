@@ -23,7 +23,7 @@ else:
     pty = None
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = {name: (ROOT / "remote" / f"{name}.sh").read_text() for name in ("connect", "discover", "task")}
+SCRIPTS = {name: (ROOT / "remote" / f"{name}.sh").read_text() for name in ("connect", "config", "discover", "task")}
 TOKEN = "test-123"
 
 
@@ -106,6 +106,23 @@ class ShellTests(unittest.TestCase):
         for name, script in SCRIPTS.items():
             result = subprocess.run(["/bin/sh", "-n"], input=script.encode(), capture_output=True)
             self.assertEqual(result.returncode, 0, (name, result.stderr))
+
+    def test_config_reads_literal_file_and_distinguishes_absence(self):
+        result = self.run_script("config", self.project, TOKEN)
+        self.assertEqual(result.returncode, 3)
+        text = b'[[tasks]]\ntarget="ok"\ndescription="Success"\n'
+        (self.project / "makeport.toml").write_bytes(text)
+        result = self.run_script("config", self.project, TOKEN)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, text)
+
+    def test_config_detects_large_file_and_bad_directory(self):
+        (self.project / "makeport.toml").write_bytes(b"x" * 70000)
+        result = self.run_script("config", self.project, TOKEN)
+        self.assertEqual(len(result.stdout), 65537)
+        result = self.run_script("config", self.project / "missing", TOKEN)
+        self.assertNotEqual(result.returncode, 3)
+        self.assertNotEqual(result.returncode, 0)
 
     def test_connection_reports_ready_after_preflight(self):
         result = self.run_script("connect", self.project, TOKEN)

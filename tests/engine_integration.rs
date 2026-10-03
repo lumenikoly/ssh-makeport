@@ -99,6 +99,36 @@ fn save_auto_connect_discover_run_stop_and_disconnect() {
     });
     harness.send(Action::Disconnect);
     harness.wait(|v| !v.desired && v.can_change);
+    // The directory file is loaded before creating the tunnel, and its menu is authoritative.
+    let reserved = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let settings = format!("[[ports]]\nremote=5173\nlocal={local}\ndescription='Preview site'\n[[tasks]]\ntarget='dev'\ndescription='Start preview'\n");
+    fs::write(project.join("makeport.toml"), &settings).unwrap();
+    harness.send(Action::Connect);
+    let view =
+        harness.wait(|v| v.connected && v.tasks.len() == 1 && v.tasks[0].title == "Start preview");
+    assert_eq!(view.ports[0].local, local);
+    assert_eq!(view.port_descriptions, ["Preview site"]);
+    harness.send(Action::Run("dev".into()));
+    harness.wait(|v| v.tasks[0].state == "Работает");
+    fs::write(
+        project.join("makeport.toml"),
+        settings.replace("Start preview", "Updated preview"),
+    )
+    .unwrap();
+    harness.send(Action::Refresh);
+    let view = harness.wait(|v| v.tasks[0].title == "Updated preview");
+    assert_eq!(view.tasks[0].state, "Работает");
+    fs::write(project.join("makeport.toml"), "bad = true").unwrap();
+    harness.send(Action::Refresh);
+    let view = harness.wait(|v| v.notice.contains("Ошибка в makeport.toml"));
+    assert!(view.connected);
+    harness.send(Action::Disconnect);
+    harness.wait(|v| !v.desired && v.can_change);
+    harness.send(Action::Connect);
+    let view = harness.wait(|v| v.connection == "Ошибка подключения");
+    assert!(!view.desired && !view.connected);
     assert!(config.join("config.toml").is_file());
     drop(harness);
     std::env::remove_var("MAKEPORT_CONFIG_DIR");
