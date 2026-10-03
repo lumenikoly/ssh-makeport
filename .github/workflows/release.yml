@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'New release tag matching Cargo.toml (for example v0.1.0)'
+        description: 'New release tag matching Cargo.toml (for example v0.2.0)'
         required: true
-        default: v0.1.0
+        default: v0.2.0
         type: string
 
 concurrency:
@@ -42,6 +42,7 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "Run releases from main." >&2; exit 1; }
           python scripts/release.py validate "$RELEASE_TAG"
+          test -s "releases/$RELEASE_TAG.md" || { echo "Missing release notes for $RELEASE_TAG." >&2; exit 1; }
           if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
             echo "Tag $RELEASE_TAG already exists. Use a new version." >&2
             exit 1
@@ -97,7 +98,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_packaging.py' -v
           python -m unittest discover -s tests -p 'test_release.py' -v
       - name: Check all targets
-        run: cargo clippy --all-targets --locked
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Build desktop application
         run: cargo build --release --locked
       - name: Sign macOS executable locally
@@ -157,4 +158,4 @@ jobs:
           gh release create "$RELEASE_TAG" release-assets/* \
             --target "$RELEASE_SHA" \
             --title "MakePort $RELEASE_TAG" \
-            --generate-notes
+            --notes-file "releases/$RELEASE_TAG.md"

@@ -8,6 +8,7 @@ import plistlib
 import shutil
 import subprocess
 import zipfile
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,14 +33,15 @@ def package(binary: Path, system: str, architecture: str, output: Path) -> Path:
         shutil.copy2(binary, executable)
         executable.chmod(0o755)
         (contents / "Resources").mkdir()
+        version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
         info = {
             "CFBundleExecutable": "makeport",
             "CFBundleIdentifier": "app.makeport.desktop",
             "CFBundleName": "MakePort",
             "CFBundleDisplayName": "MakePort",
             "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "0.1.0",
-            "CFBundleVersion": "1",
+            "CFBundleShortVersionString": version,
+            "CFBundleVersion": version,
             "LSMinimumSystemVersion": "12.0",
             "NSHighResolutionCapable": True,
         }

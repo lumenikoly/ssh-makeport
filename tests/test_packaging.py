@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("package", ROOT / "scripts" / "package.py")
@@ -48,6 +49,9 @@ class PackagingTests(unittest.TestCase):
             self.assertIn(root + "MacOS/makeport", archive.namelist())
             info = plistlib.loads(archive.read(root + "Info.plist"))
             self.assertEqual(info["CFBundleExecutable"], "makeport")
+            version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+            self.assertEqual(info["CFBundleShortVersionString"], version)
+            self.assertEqual(info["CFBundleVersion"], version)
 
 
 if __name__ == "__main__":
