@@ -108,44 +108,37 @@ fn edit(ui: &MainWindow, draft: Draft) {
     ui.set_edit_reconnect(draft.reconnect);
     ui.set_edit_error("".into());
     ui.set_editing(true);
+    ui.invoke_focus_editor();
 }
 
 fn apply(ui: &MainWindow, view: &View, previous: &View) {
     // Keep models stable while only logs change. This preserves focus/scrolling.
     if view.projects != previous.projects || view.project_states != previous.project_states {
-        ui.set_project_titles(ModelRc::new(VecModel::from(
+        ui.set_projects(ModelRc::new(VecModel::from(
             view.projects
                 .iter()
                 .enumerate()
-                .map(|(i, p)| {
-                    let label = if view
+                .map(|(i, p)| ProjectItem {
+                    title: if view
                         .projects
                         .iter()
                         .filter(|other| other.name == p.name)
                         .count()
-                        == 1
+                        > 1
                     {
-                        p.name.clone()
+                        format!("{} · {}", p.name, p.path)
                     } else {
-                        format!("{}:{}", p.host, p.path)
-                    };
-                    SharedString::from(format!(
-                        "{} · {}",
-                        label,
-                        view.project_states
-                            .get(i)
-                            .map(String::as_str)
-                            .unwrap_or("Не подключён")
-                    ))
-                })
-                .collect::<Vec<_>>(),
-        )));
-        ui.set_projects(ModelRc::new(VecModel::from(
-            view.projects
-                .iter()
-                .map(|p| ProjectItem {
-                    title: p.name.clone().into(),
+                        p.name.clone()
+                    }
+                    .into(),
                     host: p.host.clone().into(),
+                    location: format!("{} · {}", p.host, p.path).into(),
+                    state: view
+                        .project_states
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| "Не подключён".into())
+                        .into(),
                 })
                 .collect::<Vec<_>>(),
         )));
@@ -193,7 +186,8 @@ fn apply(ui: &MainWindow, view: &View, previous: &View) {
                         .into(),
                     manual: view.port_manual.get(i).copied().unwrap_or(false),
                     can_open: view.port_states.get(i).is_some_and(|s| s == "Проброшен"),
-                    mapping: format!("localhost:{} → сервер:{}", p.local, p.remote).into(),
+                    mapping: format!("localhost:{}", p.local).into(),
+                    remote: i32::from(p.remote),
                     detail: view
                         .port_descriptions
                         .get(i)
@@ -216,6 +210,9 @@ fn apply(ui: &MainWindow, view: &View, previous: &View) {
         ui.set_editing(false);
         ui.set_adding_port(false);
     }
+    if ui.get_editing() && view.notice_serial != previous.notice_serial {
+        ui.set_edit_error(view.notice.clone().into());
+    }
     if ui.get_adding_port() && view.notice_serial != previous.notice_serial {
         ui.set_port_error(view.notice.clone().into());
     }
@@ -226,6 +223,7 @@ fn apply(ui: &MainWindow, view: &View, previous: &View) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
+    ui.window().set_size(slint::LogicalSize::new(1020.0, 740.0));
     ui.set_mono_font(
         if cfg!(target_os = "macos") {
             "Menlo"
@@ -464,12 +462,18 @@ mod tests {
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
     use slint::Model;
 
-    struct TestPlatform(Rc<MinimalSoftwareWindow>);
+    struct TestPlatform(Rc<MinimalSoftwareWindow>, Rc<RefCell<String>>);
     impl slint::platform::Platform for TestPlatform {
         fn create_window_adapter(
             &self,
         ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
             Ok(self.0.clone())
+        }
+        fn set_clipboard_text(&self, text: &str, _: slint::platform::Clipboard) {
+            *self.1.borrow_mut() = text.to_owned();
+        }
+        fn clipboard_text(&self, _: slint::platform::Clipboard) -> Option<String> {
+            Some(self.1.borrow().clone())
         }
     }
 
@@ -493,9 +497,41 @@ mod tests {
     #[test]
     fn folder_form_and_config_descriptions_reach_the_ui() {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-        slint::platform::set_platform(Box::new(TestPlatform(window))).unwrap();
+        window.set_size(slint::PhysicalSize::new(880, 660));
+        let clipboard = Rc::new(RefCell::new(String::new()));
+        slint::platform::set_platform(Box::new(TestPlatform(window.clone(), clipboard.clone())))
+            .unwrap();
         let ui = MainWindow::new().unwrap();
+        ui.show().unwrap();
         edit(&ui, Draft::default());
+        let mut pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(880, 660);
+        window.draw_if_needed(|renderer| {
+            renderer.render(pixels.make_mut_slice(), 880);
+        });
+        ui.invoke_focus_editor();
+        ui.invoke_copy_value("clipboard-check".into());
+        assert_eq!(*clipboard.borrow(), "clipboard-check");
+        let press = |text: SharedString| {
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+        };
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                text: slint::platform::Key::Control.into(),
+            });
+        press("м".into()); // Ctrl+V with the Russian keyboard layout.
+        assert_eq!(ui.get_edit_host(), "clipboard-check");
+        press("ф".into());
+        press("с".into());
+        assert_eq!(*clipboard.borrow(), "clipboard-check");
+        press("ч".into());
+        assert!(ui.get_edit_host().is_empty());
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                text: slint::platform::Key::Control.into(),
+            });
         assert!(draft(&ui).into_project().is_err());
         ui.set_edit_host("developer@devbox".into());
         ui.set_edit_path("~/projects/site".into());
