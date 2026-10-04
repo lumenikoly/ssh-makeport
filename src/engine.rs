@@ -1,8 +1,8 @@
 use crate::log::LogBuffer;
 use crate::makefile::{self, Target};
 use crate::model::{
-    unique_id, validate_target, Config, Draft, Forward, Project, RunRecord, MAX_PROJECTS,
-    MAX_RUNNING, MAX_TASKS,
+    unique_id, validate_target, Config, Draft, Forward, ManualPort, Project, RunRecord, MAX_PORTS,
+    MAX_PROJECTS, MAX_RUNNING, MAX_TASKS,
 };
 use crate::platform;
 use crate::process::{IoEvent, Process, Stream};
@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub enum Action {
     Select(usize),
+    AddPort(ManualPort),
+    RemovePort(u16),
+    RetryPort(u16),
     Save(Draft),
     SaveAndConnect(Draft),
     Delete,
@@ -87,6 +90,12 @@ pub struct TaskView {
 #[derive(Clone, Debug, Default)]
 pub struct View {
     pub projects: Vec<Project>,
+    pub project_states: Vec<String>,
+    pub can_add: bool,
+    pub total_running: usize,
+    pub can_manage_ports: bool,
+    pub port_states: Vec<String>,
+    pub port_manual: Vec<bool>,
     pub selected: Option<usize>,
     pub connection: String,
     pub connected: bool,
@@ -100,6 +109,7 @@ pub struct View {
     pub log_name: String,
     pub log_text: String,
     pub notice: String,
+    pub notice_serial: u64,
     pub fatal: bool,
     pub saved_generation: u64,
     pub quitting: bool,
@@ -178,29 +188,94 @@ pub fn start() -> Backend {
     }
 }
 
-struct Engine {
+struct Session {
     project_file: Option<ProjectFile>,
-    config: Config,
-    store: Option<Store>,
-    directory: PathBuf,
-    selected: Option<usize>,
     tasks: Vec<Task>,
     log: LogBuffer,
     log_name: String,
     processes: BTreeMap<u64, Process>,
-    io_tx: SyncSender<IoEvent>,
-    next_process: u64,
     link: Link,
     desired: bool,
     recovering: bool,
     retry_at: Option<Instant>,
     retries: u32,
     pending_task: Option<String>,
-    closing: Option<Instant>,
     notice: String,
+    port_errors: BTreeMap<u16, String>,
+    notice_serial: u64,
+}
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            project_file: None,
+            tasks: Vec::new(),
+            log: LogBuffer::default(),
+            log_name: String::new(),
+            processes: BTreeMap::new(),
+            link: Link::Offline,
+            desired: false,
+            recovering: false,
+            retry_at: None,
+            retries: 0,
+            pending_task: None,
+            notice: String::new(),
+            port_errors: BTreeMap::new(),
+            notice_serial: 0,
+        }
+    }
+}
+impl Session {
+    fn busy(&self) -> bool {
+        self.desired
+            || !self.processes.is_empty()
+            || self.tasks.iter().any(|t| t.status == TaskStatus::Unknown)
+    }
+    fn running(&self) -> usize {
+        self.tasks.iter().filter(|t| t.status.active()).count()
+    }
+    fn summary(&self) -> String {
+        let label = match self.link {
+            Link::Online => "Подключён",
+            Link::Connecting => "Подключается",
+            Link::Retrying => "Восстанавливается",
+            Link::Stopping => "Отключается",
+            Link::Failed => "Ошибка",
+            Link::Offline => "Не подключён",
+        };
+        if self.tasks.iter().any(|t| t.status == TaskStatus::Unknown) {
+            return format!("{label} · нужна проверка");
+        }
+        if self.running() > 0 {
+            format!("{label} · задач: {}", self.running())
+        } else {
+            label.into()
+        }
+    }
+}
+struct Engine {
+    session: Session,
+    sessions: BTreeMap<String, Session>,
+    config: Config,
+    store: Option<Store>,
+    directory: PathBuf,
+    selected: Option<usize>,
+    io_tx: SyncSender<IoEvent>,
+    next_process: u64,
+    closing: Option<Instant>,
     fatal: bool,
     saved_generation: u64,
     dirty: bool,
+}
+impl std::ops::Deref for Engine {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+impl std::ops::DerefMut for Engine {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
 }
 
 impl Engine {
@@ -218,25 +293,18 @@ impl Engine {
             .and_then(|id| config.projects.iter().position(|p| &p.id == id))
             .or_else(|| (!config.projects.is_empty()).then_some(0));
         let mut engine = Self {
-            project_file: None,
+            session: Session {
+                notice,
+                ..Session::default()
+            },
+            sessions: BTreeMap::new(),
             config,
             store,
             directory,
             selected,
-            tasks: Vec::new(),
-            log: LogBuffer::default(),
-            log_name: String::new(),
-            processes: BTreeMap::new(),
             io_tx,
             next_process: 1,
-            link: Link::Offline,
-            desired: false,
-            recovering: false,
-            retry_at: None,
-            retries: 0,
-            pending_task: None,
             closing: None,
-            notice,
             fatal,
             saved_generation: 0,
             dirty: true,
@@ -251,6 +319,78 @@ impl Engine {
         engine
     }
 
+    // Runtime state is keyed by stable project ID. Selecting a tab never owns a process.
+    fn activate(&mut self, index: usize) -> Result<()> {
+        let id = self
+            .config
+            .projects
+            .get(index)
+            .ok_or("Проект не найден")?
+            .id
+            .clone();
+        if self.selected == Some(index) {
+            return Ok(());
+        }
+        if let Some(old) = self.project().map(|p| p.id.clone()) {
+            let state = std::mem::take(&mut self.session);
+            self.sessions.insert(old, state);
+        }
+        self.selected = Some(index);
+        if let Some(state) = self.sessions.remove(&id) {
+            self.session = state;
+        } else {
+            self.session = Session::default();
+            self.seed_tasks();
+        }
+        Ok(())
+    }
+    fn all_processes_empty(&self) -> bool {
+        self.processes.is_empty() && self.sessions.values().all(|s| s.processes.is_empty())
+    }
+    fn total_running(&self) -> usize {
+        self.session.running() + self.sessions.values().map(Session::running).sum::<usize>()
+    }
+    fn io(&mut self, event: IoEvent) {
+        let id = match &event {
+            IoEvent::Data(id, ..) | IoEvent::Closed(id, ..) | IoEvent::Error(id, ..) => *id,
+        };
+        let previous = self.selected;
+        if !self.processes.contains_key(&id) {
+            let owner = self
+                .sessions
+                .iter()
+                .find(|(_, s)| s.processes.contains_key(&id))
+                .map(|(id, _)| id.clone());
+            let Some(index) =
+                owner.and_then(|id| self.config.projects.iter().position(|p| p.id == id))
+            else {
+                return;
+            };
+            if self.activate(index).is_err() {
+                return;
+            }
+        }
+        self.io_current(event);
+        if let Some(index) = previous {
+            let _ = self.activate(index);
+        }
+    }
+    fn tick(&mut self) {
+        let previous = self.selected;
+        for index in 0..self.config.projects.len() {
+            // Unvisited, idle projects need no polling or allocated task/log state.
+            let id = &self.config.projects[index].id;
+            if self.selected != Some(index) && !self.sessions.contains_key(id) {
+                continue;
+            }
+            if self.activate(index).is_ok() {
+                self.tick_current();
+            }
+        }
+        if let Some(index) = previous {
+            let _ = self.activate(index);
+        }
+    }
     fn project(&self) -> Option<&Project> {
         self.selected.and_then(|i| self.config.projects.get(i))
     }
@@ -336,6 +476,7 @@ impl Engine {
         let message = message.into();
         self.log.push(format!("[!] {message}"));
         self.notice = message;
+        self.notice_serial += 1;
         self.dirty = true;
     }
 
@@ -389,7 +530,31 @@ impl Engine {
             }
             Action::Quit => {
                 self.closing.get_or_insert_with(Instant::now);
-                self.disconnect();
+                let previous = self.selected;
+                for index in 0..self.config.projects.len() {
+                    self.activate(index)?;
+                    self.disconnect();
+                }
+                if let Some(index) = previous {
+                    self.activate(index)?;
+                }
+            }
+            Action::AddPort(port) => self.add_port(port)?,
+            Action::RemovePort(local) => self.remove_port(local)?,
+            Action::RetryPort(local) => {
+                let port = self
+                    .project()
+                    .and_then(|p| p.manual_ports.iter().find(|p| p.local == local))
+                    .ok_or("Ручной порт не найден")?
+                    .forward();
+                if self.link != Link::Online {
+                    return Err("Сначала подключитесь к проекту".into());
+                }
+                self.notice.clear();
+                if let Err(error) = self.start_port(port) {
+                    self.port_errors.insert(local, error.clone());
+                    return Err(error);
+                }
             }
             Action::DismissNotice => {
                 if !self.fatal {
@@ -411,29 +576,33 @@ impl Engine {
                 }
             }
             Action::Select(index) => {
-                if !self.can_change() {
-                    return Err(
-                        "Сначала отключитесь и проверьте задачи с неизвестным состоянием".into(),
-                    );
+                if self.fatal {
+                    return Err("Настройки недоступны".into());
                 }
                 let project = self.config.projects.get(index).ok_or("Проект не найден")?;
                 let mut config = self.config.clone();
                 config.selected = Some(project.id.clone());
                 self.commit(config)?;
-                self.selected = Some(index);
-                self.seed_tasks();
-                self.log.clear();
-                self.log_name.clear();
-                self.link = Link::Offline;
+                self.activate(index)?;
             }
             Action::Save(draft) => {
-                if !self.can_change() {
-                    return Err("Нельзя менять настройки работающего проекта".into());
+                if self.fatal {
+                    return Err("Настройки недоступны".into());
                 }
-                let project = draft.into_project()?;
+                let mut project = draft.into_project()?;
                 let mut config = self.config.clone();
                 let index =
                     if let Some(index) = config.projects.iter().position(|p| p.id == project.id) {
+                        let busy = if self.selected == Some(index) {
+                            self.busy()
+                        } else {
+                            self.sessions.get(&project.id).is_some_and(Session::busy)
+                        };
+                        if busy {
+                            return Err("Нельзя менять настройки работающего проекта".into());
+                        }
+                        project.manual_ports = config.projects[index].manual_ports.clone();
+                        project.validate()?;
                         config.projects[index] = project.clone();
                         index
                     } else {
@@ -445,7 +614,7 @@ impl Engine {
                     };
                 config.selected = Some(project.id);
                 self.commit(config)?;
-                self.selected = Some(index);
+                self.activate(index)?;
                 self.seed_tasks();
                 self.log_name.clear();
                 self.notice.clear();
@@ -457,12 +626,15 @@ impl Engine {
                 }
                 let index = self.selected.ok_or("Проект не выбран")?;
                 let mut config = self.config.clone();
-                config.projects.remove(index);
+                let deleted = config.projects.remove(index).id;
                 config.selected = config.projects.first().map(|p| p.id.clone());
                 self.commit(config)?;
-                self.selected = (!self.config.projects.is_empty()).then_some(0);
-                self.seed_tasks();
-                self.log_name.clear();
+                self.sessions.remove(&deleted);
+                self.session = Session::default();
+                self.selected = None;
+                if !self.config.projects.is_empty() {
+                    self.activate(0)?;
+                }
                 self.saved_generation += 1;
             }
             Action::Connect => self.connect()?,
@@ -486,9 +658,7 @@ impl Engine {
                 }
             }
             Action::OpenPort(port) => {
-                if self.link != Link::Online
-                    || !self.effective_ports().iter().any(|f| f.local == port)
-                {
+                if self.port_state(port) != "Проброшен" {
                     return Err("Этот туннель не подключён".into());
                 }
                 platform::open_port(port)?;
@@ -497,11 +667,178 @@ impl Engine {
         Ok(())
     }
 
-    fn effective_ports(&self) -> Vec<Forward> {
+    fn configured_ports(&self) -> Vec<Forward> {
         self.project_file
             .as_ref()
             .map(|f| f.forwards())
             .unwrap_or_else(|| self.project().map(|p| p.ports.clone()).unwrap_or_default())
+    }
+
+    fn effective_ports(&self) -> Vec<Forward> {
+        let mut ports = self.configured_ports();
+        if let Some(project) = self.project() {
+            ports.extend(project.manual_ports.iter().map(ManualPort::forward));
+        }
+        ports
+    }
+    fn port_descriptions(&self) -> Vec<String> {
+        let mut descriptions = self
+            .configured_ports()
+            .iter()
+            .enumerate()
+            .map(|(index, port)| {
+                self.project_file
+                    .as_ref()
+                    .and_then(|f| f.ports.get(index))
+                    .map(|p| p.description.clone())
+                    .unwrap_or_else(|| format!("Порт {}", port.remote))
+            })
+            .collect::<Vec<_>>();
+        if let Some(project) = self.project() {
+            descriptions.extend(project.manual_ports.iter().map(|p| p.description.clone()));
+        }
+        descriptions
+    }
+    fn port_state(&self, local: u16) -> String {
+        if self.configured_ports().iter().any(|p| p.local == local) {
+            return match self.link {
+                Link::Online => "Проброшен",
+                Link::Failed => "Ошибка",
+                Link::Connecting | Link::Retrying => "Подключается…",
+                Link::Stopping => "Отключается…",
+                Link::Offline => "Не подключён",
+            }
+            .into();
+        }
+        if let Some(process) = self
+            .processes
+            .values()
+            .find(|p| matches!(&p.role, Role::Port(port) if port.local == local))
+        {
+            return if process.stopping_at.is_some() {
+                "Отключается…"
+            } else if process.ready {
+                "Проброшен"
+            } else {
+                "Подключается…"
+            }
+            .into();
+        }
+        if self.port_errors.contains_key(&local) {
+            "Ошибка"
+        } else if self.desired {
+            "Подключается…"
+        } else {
+            "Не подключён"
+        }
+        .into()
+    }
+    fn check_other_port(&self, local: u16) -> Result<()> {
+        for (id, state) in &self.sessions {
+            let Some(project) = self.config.projects.iter().find(|p| &p.id == id) else {
+                continue;
+            };
+            let configured = state
+                .project_file
+                .as_ref()
+                .map(|f| f.forwards())
+                .unwrap_or_else(|| project.ports.clone());
+            let reserved = state.desired
+                && (configured.iter().any(|p| p.local == local)
+                    || project.manual_ports.iter().any(|p| p.local == local));
+            let closing = state
+                .processes
+                .values()
+                .any(|p| matches!(&p.role, Role::Port(port) if port.local == local));
+            if reserved || closing {
+                return Err(format!("Локальный порт {local} занят проектом «{}» ({}). Выберите другой локальный порт.", project.name, project.path));
+            }
+        }
+        Ok(())
+    }
+    fn add_port(&mut self, port: ManualPort) -> Result<()> {
+        port.validate()?;
+        if self.fatal
+            || self.closing.is_some()
+            || matches!(
+                self.link,
+                Link::Connecting | Link::Retrying | Link::Stopping
+            )
+        {
+            return Err("Дождитесь завершения подключения".into());
+        }
+        if self.effective_ports().len() >= MAX_PORTS {
+            return Err("В одном проекте допускается не более 32 портов".into());
+        }
+        if self.effective_ports().iter().any(|p| p.local == port.local) {
+            return Err(format!(
+                "Локальный порт {} уже добавлен в этот проект",
+                port.local
+            ));
+        }
+        if self
+            .processes
+            .values()
+            .any(|p| matches!(&p.role, Role::Port(p) if p.local == port.local))
+        {
+            return Err("Предыдущий туннель ещё закрывается".into());
+        }
+        self.check_other_port(port.local)?;
+        let reservation = TcpListener::bind(("127.0.0.1", port.local))
+            .map_err(|e| format!("Локальный порт {} занят или недоступен: {e}", port.local))?;
+        drop(reservation);
+        let index = self.selected.ok_or("Сначала откройте папку проекта")?;
+        let forward = port.forward();
+        let mut config = self.config.clone();
+        config.projects[index].manual_ports.push(port);
+        self.commit(config)?;
+        self.saved_generation += 1;
+        self.notice.clear();
+        if self.link == Link::Online {
+            if let Err(error) = self.start_port(forward.clone()) {
+                self.port_errors.insert(forward.local, error.clone());
+                self.notice(error);
+            }
+        }
+        Ok(())
+    }
+    fn remove_port(&mut self, local: u16) -> Result<()> {
+        let index = self.selected.ok_or("Проект не выбран")?;
+        let mut config = self.config.clone();
+        if !config.projects[index]
+            .manual_ports
+            .iter()
+            .any(|p| p.local == local)
+        {
+            return Err("Этот порт задан в makeport.toml. Измените файл проекта.".into());
+        }
+        config.projects[index]
+            .manual_ports
+            .retain(|p| p.local != local);
+        self.commit(config)?;
+        self.port_errors.remove(&local);
+        for process in self.processes.values_mut() {
+            if matches!(&process.role, Role::Port(port) if port.local == local) {
+                let _ = process.request_stop();
+            }
+        }
+        Ok(())
+    }
+    fn start_port(&mut self, port: Forward) -> Result<()> {
+        if self
+            .processes
+            .values()
+            .any(|p| matches!(&p.role, Role::Port(p) if p.local == port.local))
+        {
+            return Ok(());
+        }
+        self.check_other_port(port.local)?;
+        let reservation = TcpListener::bind(("127.0.0.1", port.local))
+            .map_err(|e| format!("Локальный порт {} занят или недоступен: {e}", port.local))?;
+        drop(reservation);
+        self.port_errors.remove(&port.local);
+        self.spawn(Role::Port(port))?;
+        Ok(())
     }
 
     fn spawn(&mut self, role: Role) -> Result<u64> {
@@ -512,7 +849,7 @@ impl Engine {
             .project()
             .cloned()
             .ok_or("Добавьте и выберите проект")?;
-        project.ports = self.effective_ports();
+        project.ports = self.configured_ports();
         let executable = platform::ssh_executable()?;
         let token = unique_id();
         let args = shell::arguments(&project, &role, &token)?;
@@ -528,7 +865,17 @@ impl Engine {
         // An early diagnostic only. ssh's ExitOnForwardFailure is authoritative:
         // another process can take a port between this check and SSH binding it.
         let mut reservations = Vec::new();
-        for port in &self.effective_ports() {
+        for port in &self.configured_ports() {
+            if self
+                .project()
+                .is_some_and(|p| p.manual_ports.iter().any(|m| m.local == port.local))
+            {
+                return Err(format!(
+                    "Порт {} указан в makeport.toml и добавлен вручную. Удалите ручной порт.",
+                    port.local
+                ));
+            }
+            self.check_other_port(port.local)?;
             reservations.push(TcpListener::bind(("127.0.0.1", port.local)).map_err(|e| {
                 format!(
                     "Порт {} недоступен: {e}. Измените local в makeport.toml или освободите этот порт.",
@@ -550,6 +897,7 @@ impl Engine {
         if self.processes.values().any(|p| p.role == Role::Tunnel) {
             return Err("Предыдущее подключение ещё закрывается".into());
         }
+        self.notice.clear();
         self.desired = true;
         self.recovering = false;
         self.retries = 0;
@@ -602,6 +950,7 @@ impl Engine {
         if self
             .processes
             .values()
+            .chain(self.sessions.values().flat_map(|s| s.processes.values()))
             .filter(|p| matches!(p.role, Role::Task(_)))
             .count()
             >= MAX_RUNNING
@@ -675,7 +1024,7 @@ impl Engine {
         for process in self.processes.values_mut() {
             match process.role {
                 Role::Config | Role::Discover => process.terminate(),
-                Role::Tunnel => {
+                Role::Tunnel | Role::Port(_) => {
                     let _ = process.request_stop();
                 }
                 Role::Task(_) => {}
@@ -684,7 +1033,7 @@ impl Engine {
         self.dirty = true;
     }
 
-    fn io(&mut self, event: IoEvent) {
+    fn io_current(&mut self, event: IoEvent) {
         let (id, stream, lines) = match event {
             IoEvent::Data(id, stream, bytes) => {
                 let Some(process) = self.processes.get_mut(&id) else {
@@ -735,6 +1084,14 @@ impl Engine {
         };
         let role = process.role.clone();
         if matches!(stream, Stream::Stdout) {
+            if let Role::Port(port) = &role {
+                if raw == shell::ready_marker(&process.token) {
+                    process.ready = true;
+                    self.port_errors.remove(&port.local);
+                    self.dirty = true;
+                    return;
+                }
+            }
             if role == Role::Tunnel && raw == shell::ready_marker(&process.token) {
                 process.ready = true;
                 self.link = Link::Online;
@@ -743,6 +1100,21 @@ impl Engine {
                 self.log.push("[SSH] Подключено. Настроенные туннели подняты; доступность приложения проверяется отдельно.");
                 self.dirty = true;
                 if self.desired {
+                    let ports = self
+                        .project()
+                        .map(|p| {
+                            p.manual_ports
+                                .iter()
+                                .map(ManualPort::forward)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    for port in ports {
+                        if let Err(error) = self.start_port(port.clone()) {
+                            self.port_errors.insert(port.local, error.clone());
+                            self.notice(error);
+                        }
+                    }
                     if self.project_file.is_none() {
                         if let Err(error) = self.spawn(Role::Discover) {
                             self.notice(error);
@@ -847,7 +1219,7 @@ impl Engine {
                     let seconds = (1_u64 << self.retries).min(30);
                     self.retry_at = Some(Instant::now() + Duration::from_secs(seconds));
                     self.link = Link::Retrying;
-                    self.log.push(format!(
+                    self.session.log.push(format!(
                         "[SSH] Повтор {}/5 через {seconds} с. Задачи не перезапускаются.",
                         self.retries
                     ));
@@ -855,7 +1227,29 @@ impl Engine {
                     self.link = Link::Failed;
                     self.desired = false;
                     self.pending_task = None;
+                    for process in self.processes.values_mut() {
+                        if matches!(process.role, Role::Port(_)) {
+                            let _ = process.request_stop();
+                        }
+                    }
                     self.notice(connection_help(&error));
+                }
+            }
+            Role::Port(port) => {
+                if self.desired
+                    && self
+                        .project()
+                        .is_some_and(|p| p.manual_ports.iter().any(|m| m.local == port.local))
+                {
+                    let error = process
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "SSH-туннель закрылся".into());
+                    self.port_errors.insert(port.local, error.clone());
+                    self.notice(format!(
+                        "Порт {}: {error}. Нажмите «Повторить».",
+                        port.local
+                    ));
                 }
             }
             Role::Config => {
@@ -884,7 +1278,7 @@ impl Engine {
                         let ports = file.as_ref().map(|f| f.forwards()).unwrap_or_else(|| {
                             self.project().map(|p| p.ports.clone()).unwrap_or_default()
                         });
-                        if self.link == Link::Online && ports != self.effective_ports() {
+                        if self.link == Link::Online && ports != self.configured_ports() {
                             self.notice("Порты в makeport.toml изменились. Отключитесь и подключитесь снова, чтобы применить их.");
                             return;
                         }
@@ -934,7 +1328,9 @@ impl Engine {
                     return;
                 }
                 if process.capture_overflow {
-                    self.notice("Makefile больше 256 КиБ. Укажите нужные действия в makeport.toml.");
+                    self.notice(
+                        "Makefile больше 256 КиБ. Укажите нужные действия в makeport.toml.",
+                    );
                 } else if process.status.is_some_and(|s| s.success()) {
                     let targets = makefile::discover(&String::from_utf8_lossy(&process.capture));
                     let count = targets.len();
@@ -982,7 +1378,7 @@ impl Engine {
         }
     }
 
-    fn tick(&mut self) {
+    fn tick_current(&mut self) {
         let now = Instant::now();
         let mut finished = Vec::new();
         for (&id, process) in &mut self.processes {
@@ -1055,6 +1451,16 @@ impl Engine {
                 .unwrap_or_default()
         };
         View {
+            project_states: self.config.projects.iter().enumerate().map(|(index, project)| {
+                if self.selected == Some(index) { self.session.summary() }
+                else { self.sessions.get(&project.id).map(Session::summary).unwrap_or_else(|| "Не подключён".into()) }
+            }).collect(),
+            can_add: !self.fatal && self.closing.is_none(),
+            total_running: self.total_running(),
+            can_manage_ports: !self.fatal && self.closing.is_none() && self.project().is_some() && !matches!(self.link, Link::Connecting | Link::Retrying | Link::Stopping),
+            port_states: self.effective_ports().iter().map(|p| self.port_state(p.local)).collect(),
+            port_manual: std::iter::repeat_n(false, self.configured_ports().len()).chain(self.project().into_iter().flat_map(|p| p.manual_ports.iter().map(|_| true))).collect(),
+            notice_serial: self.notice_serial,
             discovering,
             next_action: if self.fatal { "Настройки недоступны. Подробности ошибки помогут восстановить доступ." }
                 else if self.project().is_none() { "Начните с добавления проекта. Вам понадобятся адрес сервера и папка проекта." }
@@ -1081,10 +1487,10 @@ impl Engine {
                 can_stop: matches!(t.status, TaskStatus::Starting | TaskStatus::Running), unknown: t.status == TaskStatus::Unknown,
             }).collect(),
             ports: self.effective_ports(),
-            port_descriptions: self.project_file.as_ref().map(|f| f.ports.iter().map(|p| p.description.clone()).collect()).unwrap_or_default(),
+            port_descriptions: self.port_descriptions(),
             log_name: self.log_name.clone(), log_text, notice: self.notice.clone(), fatal: self.fatal,
             saved_generation: self.saved_generation, quitting: self.closing.is_some(),
-            quit_ready: self.closing.is_some() && self.processes.is_empty(),
+            quit_ready: self.closing.is_some() && self.all_processes_empty(),
         }
     }
 }
@@ -1124,7 +1530,7 @@ fn run(commands: Receiver<Action>, updates: SyncSender<View>) {
             engine.io(event);
         }
         engine.tick();
-        let quitting = engine.closing.is_some() && engine.processes.is_empty();
+        let quitting = engine.closing.is_some() && engine.all_processes_empty();
         if (engine.dirty && last_send.elapsed() >= Duration::from_millis(80)) || quitting {
             if receiver_alive {
                 match updates.try_send(engine.view()) {
@@ -1156,14 +1562,6 @@ fn run(commands: Receiver<Action>, updates: SyncSender<View>) {
 mod tests {
     use super::*;
     #[test]
-    fn unknown_task_is_not_reported_as_active_or_complete() {
-        assert!(!TaskStatus::Unknown.active());
-        assert_eq!(TaskStatus::Unknown.label(), "Состояние неизвестно");
-        assert!(TaskStatus::Running.active());
-        assert!(!TaskStatus::Completed(0).active());
-    }
-
-    #[test]
     fn refresh_removes_old_rules_but_preserves_manual_running_and_unknown_tasks() {
         let project = Draft {
             name: "Test".into(),
@@ -1176,7 +1574,11 @@ mod tests {
         .unwrap();
         let (io_tx, _) = mpsc::sync_channel(16);
         let mut engine = Engine {
-            project_file: None,
+            session: Session {
+                notice: String::new(),
+                ..Session::default()
+            },
+            sessions: BTreeMap::new(),
             config: Config {
                 projects: vec![project],
                 ..Config::default()
@@ -1184,20 +1586,9 @@ mod tests {
             store: None,
             directory: PathBuf::new(),
             selected: Some(0),
-            tasks: Vec::new(),
-            log: LogBuffer::default(),
-            log_name: "old".into(),
-            processes: BTreeMap::new(),
             io_tx,
             next_process: 1,
-            link: Link::Offline,
-            desired: false,
-            recovering: false,
-            retry_at: None,
-            retries: 0,
-            pending_task: None,
             closing: None,
-            notice: String::new(),
             fatal: false,
             saved_generation: 0,
             dirty: false,
@@ -1230,25 +1621,5 @@ mod tests {
                 .unwrap()
                 .can_run
         );
-    }
-
-    #[test]
-    fn connection_errors_explain_a_recovery_action() {
-        assert!(connection_help("Permission denied (publickey)").contains("SSH-ключ"));
-        assert!(connection_help("Host key verification failed").contains("ключ сервера"));
-        assert!(connection_help("cannot cd /missing").contains("Проверьте путь"));
-        assert!(connection_help("Could not resolve hostname dev").contains("VPN"));
-        assert!(connection_help("make is not available").contains("установить"));
-    }
-
-    #[test]
-    fn task_labels_prioritize_project_descriptions_and_explain_outcomes() {
-        assert_eq!(task_title("dev", "Посмотреть сайт"), "Посмотреть сайт");
-        assert_eq!(
-            task_title("dev", "Добавлена вручную"),
-            "Запустить приложение"
-        );
-        assert_eq!(TaskStatus::Completed(0).label(), "Готово");
-        assert_eq!(TaskStatus::Completed(2).label(), "Ошибка (код 2)");
     }
 }

@@ -1,4 +1,4 @@
-use crate::model::{validate_target, Project};
+use crate::model::{validate_target, Forward, Project};
 use crate::Result;
 
 pub const CONFIG_SCRIPT: &str = include_str!("../remote/config.sh");
@@ -10,6 +10,7 @@ pub const TASK_SCRIPT: &str = include_str!("../remote/task.sh");
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     Tunnel,
+    Port(Forward),
     Config,
     Discover,
     Task(String),
@@ -32,7 +33,7 @@ pub fn exit_marker(token: &str) -> String {
 pub fn remote_command(project: &Project, role: &Role, token: &str) -> Result<String> {
     project.validate()?;
     let script = match role {
-        Role::Tunnel => CONNECT_SCRIPT,
+        Role::Tunnel | Role::Port(_) => CONNECT_SCRIPT,
         Role::Config => CONFIG_SCRIPT,
         Role::Discover => DISCOVER_SCRIPT,
         Role::Task(target) => {
@@ -87,6 +88,15 @@ pub fn arguments(project: &Project, role: &Role, token: &str) -> Result<Vec<Stri
                 args.extend(["-L".into(), port.argument()]);
             }
         }
+        Role::Port(port) => {
+            args.extend([
+                "-T".into(),
+                "-o".into(),
+                "ClearAllForwardings=no".into(),
+                "-L".into(),
+                port.argument(),
+            ]);
+        }
         Role::Config | Role::Discover => {
             args.extend(["-T".into(), "-o".into(), "ClearAllForwardings=yes".into()])
         }
@@ -103,6 +113,7 @@ mod tests {
     use crate::model::Forward;
     fn project() -> Project {
         Project {
+            manual_ports: Vec::new(),
             id: "a".into(),
             name: "test".into(),
             host: "dev".into(),

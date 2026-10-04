@@ -5,7 +5,7 @@ export struct TaskItem {
     name: string, title: string, description: string, state: string,
     active: bool, can-run: bool, can-stop: bool, unknown: bool,
 }
-export struct PortItem { local: int, mapping: string, detail: string }
+export struct PortItem { local: int, mapping: string, detail: string, state: string, manual: bool, can-open: bool }
 
 global Theme {
     out property <color> canvas: #f5f6fb;
@@ -18,6 +18,7 @@ global Theme {
 
 component ActionButton inherits Rectangle {
     in property <string> text;
+    in property <string> accessible-name: root.text;
     in property <bool> enabled: true;
     in property <bool> primary: false;
     in property <bool> quiet: false;
@@ -31,7 +32,7 @@ component ActionButton inherits Rectangle {
     border-width: focus.has-focus ? 2px : 0px;
     border-color: #b2a6e5;
     accessible-role: button;
-    accessible-label: root.text;
+    accessible-label: root.accessible-name;
     accessible-enabled: root.enabled;
     accessible-action-default => { if root.enabled { focus.focus(); root.clicked(); } }
     forward-focus: focus;
@@ -102,6 +103,9 @@ export component MainWindow inherits Window {
     in property <bool> connected;
     in property <bool> desired;
     in property <bool> can-change;
+    in property <bool> can-add;
+    in property <bool> can-manage-ports;
+    in property <int> total-running;
     in property <bool> can-connect;
     in property <int> running;
     in property <string> next-action;
@@ -127,7 +131,15 @@ export component MainWindow inherits Window {
     in-out property <string> confirm-kind;
     in-out property <string> confirm-target;
     in-out property <bool> follow-log: true;
-    private property <bool> interactive: !root.editing && !root.show-log && root.confirm-kind == "" && !root.quitting;
+    in-out property <bool> adding-port: false;
+    in-out property <string> port-remote;
+    in-out property <string> port-local;
+    in-out property <string> port-description;
+    in-out property <string> port-error;
+    callback add-port(string, string, string);
+    callback remove-port(int);
+    callback retry-port(int);
+    private property <bool> interactive: !root.editing && !root.adding-port && !root.show-log && root.confirm-kind == "" && !root.quitting;
 
     callback select-project(int);
     callback new-project();
@@ -163,10 +175,11 @@ export component MainWindow inherits Window {
             if root.projects.length > 1: chooser := ComboBox {
                 model: root.project-titles;
                 current-index: root.selected;
-                enabled: root.can-change && root.interactive;
+                width: 260px;
+                enabled: root.can-add && root.interactive;
                 selected(index) => { root.select-project(chooser.current-index); }
             }
-            if root.selected >= 0: ActionButton { text: "Открыть папку…"; enabled: root.can-change && root.interactive; clicked => { root.new-project(); } }
+            if root.selected >= 0: ActionButton { text: "Открыть папку…"; enabled: root.can-add && root.interactive; clicked => { root.new-project(); } }
         }
         if root.selected >= 0: HorizontalLayout {
             spacing: 8px;
@@ -210,9 +223,14 @@ export component MainWindow inherits Window {
                     spacing: 14px;
                     Heading { text: "Откройте проект на сервере"; font-size: 22px; }
                     Text { text: "Укажите SSH-адрес и папку. Порты и действия загрузятся из makeport.toml."; wrap: word-wrap; color: Theme.muted; }
-                    ActionButton { text: "Открыть папку…"; width: 190px; primary: true; enabled: root.can-change && root.interactive; clicked => { root.new-project(); } }
+                    ActionButton { text: "Открыть папку…"; width: 190px; primary: true; enabled: root.can-add && root.interactive; clicked => { root.new-project(); } }
                 }
-                if root.ports.length > 0: Heading { text: "Порты"; height: 24px; font-size: 13px; color: Theme.muted; }
+                if root.selected >= 0: HorizontalLayout {
+                    Heading { text: "Порты"; font-size: 13px; color: Theme.muted; vertical-alignment: center; horizontal-stretch: 1; }
+                    ActionButton { text: "+ Порт"; quiet: true; enabled: root.can-manage-ports && root.interactive; clicked => {
+                        root.port-remote = ""; root.port-local = ""; root.port-description = ""; root.port-error = ""; root.adding-port = true;
+                    } }
+                }
                 for port in root.ports: Rectangle {
                     height: 64px;
                     background: Theme.surface;
@@ -225,10 +243,16 @@ export component MainWindow inherits Window {
                             horizontal-stretch: 1;
                             spacing: 5px;
                             Heading { text: port.detail; overflow: elide; }
-                            Text { text: port.mapping; font-size: 12px; color: Theme.muted; }
+                            Text { text: port.mapping + (port.manual ? " · вручную" : ""); font-size: 12px; color: Theme.muted; }
                         }
-                        Status { width: 140px; text: root.connected ? "Проброшен" : root.connection == "Ошибка подключения" ? "Ошибка" : root.desired ? "Подключается…" : "Не подключён"; tone: root.connected ? 1 : root.connection == "Ошибка подключения" ? 2 : root.desired ? 3 : 0; }
-                        ActionButton { width: 110px; horizontal-stretch: 0; text: "Открыть"; enabled: root.connected && root.interactive; clicked => { root.open-port(port.local); } }
+                        Status { width: 140px; text: port.state; tone: port.state == "Проброшен" ? 1 : port.state == "Ошибка" ? 2 : 0; }
+                        ActionButton {
+                            width: 110px; text: port.manual && port.state == "Ошибка" ? "Повторить" : "Открыть";
+                            enabled: root.interactive && (port.can-open || (port.manual && port.state == "Ошибка" && root.connected));
+                            clicked => { if port.manual && port.state == "Ошибка" { root.retry-port(port.local); } else { root.open-port(port.local); } }
+                        }
+                        if port.manual: ActionButton { text: "×"; accessible-name: "Удалить ручной порт " + port.local; width: 40px; enabled: root.interactive && root.can-manage-ports; clicked => { root.remove-port(port.local); } }
+
                     }
                 }
                 if root.tasks.length > 0: Heading { text: "Действия"; height: 24px; font-size: 13px; color: Theme.muted; }
@@ -305,6 +329,43 @@ export component MainWindow inherits Window {
             }
         }
     }
+    if root.adding-port: Rectangle {
+        background: #20263e66;
+        Rectangle {
+            width: min(520px, parent.width - 32px); height: 380px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            background: Theme.surface; border-radius: 20px;
+            VerticalLayout {
+                padding: 24px; spacing: 12px;
+                Heading { text: "Добавить порт"; font-size: 22px; }
+                Text { text: root.project-name; color: Theme.muted; }
+                HorizontalLayout {
+                    spacing: 16px;
+                    VerticalLayout {
+                        spacing: 6px;
+                        Text { text: "На сервере"; color: Theme.ink; }
+                        LineEdit { text <=> root.port-remote; placeholder-text: "Например, 5173"; }
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        Text { text: "На этом компьютере"; color: Theme.ink; }
+                        LineEdit { text <=> root.port-local; placeholder-text: "Такой же"; }
+                    }
+                }
+                Text { text: "Описание"; color: Theme.ink; }
+                LineEdit { text <=> root.port-description; placeholder-text: "Например, сайт для просмотра"; }
+                Text { text: root.connected ? "Подключим сразу. Задачи и другие проекты продолжат работу." : "Сохраним для этой папки. Порт подключится вместе с проектом."; color: Theme.muted; wrap: word-wrap; }
+                Text { text: root.port-error; color: #ac4548; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    ActionButton { text: "Отмена"; clicked => { root.adding-port = false; } }
+                    ActionButton { text: "Добавить"; primary: true; clicked => { root.add-port(root.port-local, root.port-remote, root.port-description); } }
+                }
+            }
+        }
+    }
     if root.show-log: Rectangle {
         background: #20263e66;
         Rectangle {
@@ -332,7 +393,7 @@ export component MainWindow inherits Window {
             VerticalLayout {
                 padding: 24px; spacing: 16px;
                 Heading { text: root.confirm-kind == "reset" ? "Задача уже завершена?" : root.confirm-kind == "delete" ? "Удалить сохранённую папку?" : "Остановить задачи?"; font-size: 20px; }
-                Text { text: root.confirm-kind == "reset" ? "Проверьте процесс на сервере. Подтвердите только если задача завершена — это разрешит повторный запуск." : root.confirm-kind == "delete" ? "Папка и файлы на сервере сохранятся." : "Активные задачи будут остановлены, подключение закроется."; wrap: word-wrap; }
+                Text { text: root.confirm-kind == "reset" ? "Проверьте процесс на сервере. Подтвердите только если задача завершена — это разрешит повторный запуск." : root.confirm-kind == "delete" ? "Папка и файлы на сервере сохранятся." : root.confirm-kind == "quit" ? "Задачи во всех проектах будут остановлены, подключения закроются." : "Задачи выбранного проекта будут остановлены. Остальные подключения продолжат работу."; wrap: word-wrap; }
                 HorizontalLayout {
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }

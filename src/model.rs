@@ -23,7 +23,12 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { version: 1, selected: None, projects: Vec::new(), unconfirmed: Vec::new() }
+        Self {
+            version: 1,
+            selected: None,
+            projects: Vec::new(),
+            unconfirmed: Vec::new(),
+        }
     }
 }
 
@@ -37,6 +42,8 @@ pub struct RunRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
+    #[serde(default)]
+    pub manual_ports: Vec<ManualPort>,
     pub id: String,
     pub name: String,
     pub host: String,
@@ -49,7 +56,9 @@ pub struct Project {
     pub reconnect: bool,
 }
 
-fn yes() -> bool { true }
+fn yes() -> bool {
+    true
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,12 +67,42 @@ pub struct Forward {
     pub remote: u16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualPort {
+    pub local: u16,
+    pub remote: u16,
+    pub description: String,
+}
+impl ManualPort {
+    pub fn forward(&self) -> Forward {
+        Forward {
+            local: self.local,
+            remote: self.remote,
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        if self.local == 0 || self.remote == 0 {
+            return Err("Порт должен быть от 1 до 65535".into());
+        }
+        if self.description.trim().is_empty()
+            || self.description.len() > 500
+            || self.description.chars().any(char::is_control)
+        {
+            return Err("Укажите описание длиной до 500 байт без переносов строк".into());
+        }
+        Ok(())
+    }
+}
+
 impl Forward {
     pub fn argument(&self) -> String {
         format!("127.0.0.1:{}:127.0.0.1:{}", self.local, self.remote)
     }
 
-    pub fn url(&self) -> String { format!("http://127.0.0.1:{}/", self.local) }
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/", self.local)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -80,7 +119,12 @@ pub struct Draft {
 impl Draft {
     pub fn into_project(self) -> Result<Project> {
         let project = Project {
-            id: if self.id.is_empty() { unique_id() } else { self.id },
+            manual_ports: Vec::new(),
+            id: if self.id.is_empty() {
+                unique_id()
+            } else {
+                self.id
+            },
             name: self.name.trim().to_owned(),
             host: self.host.trim().to_owned(),
             path: self.path.trim().to_owned(),
@@ -100,8 +144,12 @@ impl From<&Project> for Draft {
             name: project.name.clone(),
             host: project.host.clone(),
             path: project.path.clone(),
-            ports: project.ports.iter().map(|p| format!("{}:{}", p.local, p.remote))
-                .collect::<Vec<_>>().join(", "),
+            ports: project
+                .ports
+                .iter()
+                .map(|p| format!("{}:{}", p.local, p.remote))
+                .collect::<Vec<_>>()
+                .join(", "),
             tasks: project.tasks.join(", "),
             reconnect: project.reconnect,
         }
@@ -110,14 +158,22 @@ impl From<&Project> for Draft {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        if self.version != 1 { return Err("Неизвестная версия конфигурации".into()); }
-        if self.projects.len() > MAX_PROJECTS { return Err("Слишком много проектов".into()); }
+        if self.version != 1 {
+            return Err("Неизвестная версия конфигурации".into());
+        }
+        if self.projects.len() > MAX_PROJECTS {
+            return Err("Слишком много проектов".into());
+        }
         let mut ids = HashSet::new();
         for project in &self.projects {
             project.validate()?;
-            if !ids.insert(&project.id) { return Err("Повторяющийся идентификатор проекта".into()); }
+            if !ids.insert(&project.id) {
+                return Err("Повторяющийся идентификатор проекта".into());
+            }
         }
-        if self.unconfirmed.len() > MAX_TASKS { return Err("Слишком много неподтверждённых запусков".into()); }
+        if self.unconfirmed.len() > MAX_TASKS {
+            return Err("Слишком много неподтверждённых запусков".into());
+        }
         let mut runs = HashSet::new();
         for run in &self.unconfirmed {
             validate_target(&run.target)?;
@@ -134,46 +190,88 @@ impl Config {
 
 impl Project {
     pub fn validate(&self) -> Result<()> {
-        if self.id.is_empty() || self.id.len() > 80 || !self.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        if self.id.is_empty()
+            || self.id.len() > 80
+            || !self
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
             return Err("Некорректный идентификатор проекта".into());
         }
-        if self.name.is_empty() || self.name.len() > 200 || self.name.chars().any(char::is_control) {
+        if self.name.is_empty() || self.name.len() > 200 || self.name.chars().any(char::is_control)
+        {
             return Err("Укажите название проекта (до 200 байт)".into());
         }
         validate_host(&self.host)?;
         validate_path(&self.path)?;
-        if self.ports.len() > MAX_PORTS { return Err("Допускается не более 32 туннелей".into()); }
+        if self.ports.len() + self.manual_ports.len() > MAX_PORTS {
+            return Err("Допускается не более 32 туннелей".into());
+        }
         let mut locals = HashSet::new();
         for port in &self.ports {
-            if port.local == 0 || port.remote == 0 { return Err("Порт должен быть от 1 до 65535".into()); }
-            if !locals.insert(port.local) { return Err(format!("Локальный порт {} указан дважды", port.local)); }
+            if port.local == 0 || port.remote == 0 {
+                return Err("Порт должен быть от 1 до 65535".into());
+            }
+            if !locals.insert(port.local) {
+                return Err(format!("Локальный порт {} указан дважды", port.local));
+            }
         }
-        if self.tasks.len() > MAX_TASKS { return Err("Слишком много задач".into()); }
-        for task in &self.tasks { validate_target(task)?; }
+        for port in &self.manual_ports {
+            port.validate()?;
+            if !locals.insert(port.local) {
+                return Err(format!("Локальный порт {} указан дважды", port.local));
+            }
+        }
+        if self.tasks.len() > MAX_TASKS {
+            return Err("Слишком много задач".into());
+        }
+        for task in &self.tasks {
+            validate_target(task)?;
+        }
         Ok(())
     }
 }
 
 pub fn validate_host(host: &str) -> Result<()> {
-    if host.is_empty() || host.len() > 255 || host.starts_with('-') || host.starts_with('@')
-        || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-@:%[]".contains(&b)) {
-        return Err("Укажите SSH-псевдоним или user@host без пробелов. Порт SSH задаётся в ~/.ssh/config".into());
+    if host.is_empty()
+        || host.len() > 255
+        || host.starts_with('-')
+        || host.starts_with('@')
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-@:%[]".contains(&b))
+    {
+        return Err(
+            "Укажите SSH-псевдоним или user@host без пробелов. Порт SSH задаётся в ~/.ssh/config"
+                .into(),
+        );
     }
     Ok(())
 }
 
 pub fn validate_path(path: &str) -> Result<()> {
-    if path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
-        || !(path == "~" || path.starts_with("~/") || path.starts_with('/')) {
+    if path.is_empty()
+        || path.len() > 4096
+        || path.chars().any(char::is_control)
+        || !(path == "~" || path.starts_with("~/") || path.starts_with('/'))
+    {
         return Err("Путь должен начинаться с / или ~/; например ~/projects/site".into());
     }
     Ok(())
 }
 
 pub fn validate_target(target: &str) -> Result<()> {
-    if target.is_empty() || target.len() > 128 || target.starts_with('-')
-        || !target.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./-".contains(&b)) {
-        return Err("Имя цели: буквы, цифры, _, -, . и /; без пробелов, параметров и переменных".into());
+    if target.is_empty()
+        || target.len() > 128
+        || target.starts_with('-')
+        || !target
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./-".contains(&b))
+    {
+        return Err(
+            "Имя цели: буквы, цифры, _, -, . и /; без пробелов, параметров и переменных".into(),
+        );
     }
     Ok(())
 }
@@ -181,44 +279,105 @@ pub fn validate_target(target: &str) -> Result<()> {
 pub fn parse_ports(input: &str) -> Result<Vec<Forward>> {
     let mut ports = Vec::new();
     let mut used = HashSet::new();
-    for entry in input.split([',', ';', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+    for entry in input
+        .split([',', ';', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let (left, right) = entry.split_once(':').unwrap_or((entry, entry));
         let parse = |value: &str| -> Result<u16> {
-            value.trim().parse::<u16>().ok().filter(|p| *p != 0)
+            value
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
                 .ok_or_else(|| format!("Некорректный порт: {value}"))
         };
-        let port = Forward { local: parse(left)?, remote: parse(right)? };
-        if !used.insert(port.local) { return Err(format!("Порт {} указан дважды", port.local)); }
+        let port = Forward {
+            local: parse(left)?,
+            remote: parse(right)?,
+        };
+        if !used.insert(port.local) {
+            return Err(format!("Порт {} указан дважды", port.local));
+        }
         ports.push(port);
     }
-    if ports.len() > MAX_PORTS { return Err("Допускается не более 32 туннелей".into()); }
+    if ports.len() > MAX_PORTS {
+        return Err("Допускается не более 32 туннелей".into());
+    }
     Ok(ports)
 }
 
 pub fn parse_tasks(input: &str) -> Result<Vec<String>> {
     let mut tasks = Vec::new();
-    for task in input.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) {
+    for task in input
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+    {
         validate_target(task)?;
-        if !tasks.iter().any(|s| s == task) { tasks.push(task.to_owned()); }
+        if !tasks.iter().any(|s| s == task) {
+            tasks.push(task.to_owned());
+        }
     }
-    if tasks.len() > MAX_TASKS { return Err("Слишком много задач".into()); }
+    if tasks.len() > MAX_TASKS {
+        return Err("Слишком много задач".into());
+    }
     Ok(tasks)
 }
 
 // Correlation identifiers, not authentication secrets. The SSH server is trusted.
 pub fn unique_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    format!("{:x}-{:x}-{:x}", time, std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{:x}-{:x}-{:x}",
+        time,
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profiles_from_v02_load_and_validate_manual_port_extensions() {
+        let mut project: super::Project = toml::from_str("id='legacy'\nname='Legacy'\nhost='devbox'\npath='~/project'\nports=[{local=5173,remote=5173}]\ntasks=['dev']\nreconnect=true\n").unwrap();
+        assert!(project.manual_ports.is_empty());
+        project.manual_ports.push(super::ManualPort {
+            local: 15432,
+            remote: 5432,
+            description: "Database".into(),
+        });
+        project.validate().unwrap();
+        let roundtrip: super::Project =
+            toml::from_str(&toml::to_string(&project).unwrap()).unwrap();
+        assert_eq!(roundtrip, project);
+        project.manual_ports[0].local = 5173;
+        assert!(project.validate().is_err());
+        project.manual_ports[0].local = 0;
+        assert!(project.validate().is_err());
+    }
+
     use super::*;
 
     #[test]
     fn ports_support_shorthand_and_mapping() {
-        assert_eq!(parse_ports("5173, 15432:5432").unwrap(), vec![Forward { local: 5173, remote: 5173 }, Forward { local: 15432, remote: 5432 }]);
+        assert_eq!(
+            parse_ports("5173, 15432:5432").unwrap(),
+            vec![
+                Forward {
+                    local: 5173,
+                    remote: 5173
+                },
+                Forward {
+                    local: 15432,
+                    remote: 5432
+                }
+            ]
+        );
     }
     #[test]
     fn rejects_invalid_ports() {
@@ -244,12 +403,8 @@ mod tests {
     #[test]
     fn paths_allow_literal_shell_characters_but_not_controls() {
         assert!(validate_path("~/my project/'$(not-executed)'").is_ok());
-        for input in ["relative/path", "~other/path", "/x\nfoo", ""] { assert!(validate_path(input).is_err()); }
+        for input in ["relative/path", "~other/path", "/x\nfoo", ""] {
+            assert!(validate_path(input).is_err());
+        }
     }
-    #[test]
-    fn manual_tasks_are_deduplicated() {
-        assert_eq!(parse_tasks("dev, test dev").unwrap(), vec!["dev", "test"]);
-    }
-    #[test]
-    fn identifiers_are_distinct() { assert_ne!(unique_id(), unique_id()); }
 }

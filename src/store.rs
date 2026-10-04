@@ -48,6 +48,11 @@ impl Store {
     pub fn save(&self, config: &Config) -> Result<()> {
         config.validate()?;
         let contents = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
+        if contents.len() > 1024 * 1024 {
+            return Err(
+                "Файл настроек превышает 1 МиБ. Сократите описания или число профилей.".into(),
+            );
+        }
         let mut temporary = tempfile::NamedTempFile::new_in(&self.directory).map_err(|e| e.to_string())?;
         temporary.write_all(contents.as_bytes()).map_err(|e| e.to_string())?;
         temporary.as_file().sync_all().map_err(|e| e.to_string())?;
@@ -60,6 +65,37 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oversized_settings_never_replace_the_readable_configuration() {
+        use crate::model::{Draft, ManualPort};
+        let temp = tempfile::tempdir().unwrap();
+        let (store, mut config) = super::Store::open(temp.path()).unwrap();
+        store.save(&config).unwrap();
+        let original = std::fs::read(store.path()).unwrap();
+        for index in 0..64 {
+            let mut project = Draft {
+                id: format!("p{index}"),
+                name: "Project".into(),
+                host: "devbox".into(),
+                path: format!("/{}", "a".repeat(3900)),
+                ..Draft::default()
+            }
+            .into_project()
+            .unwrap();
+            project.manual_ports = (1000..1032)
+                .map(|local| ManualPort {
+                    local,
+                    remote: 80,
+                    description: "a".repeat(500),
+                })
+                .collect();
+            config.projects.push(project);
+        }
+        config.validate().unwrap();
+        assert!(store.save(&config).unwrap_err().contains("1 МиБ"));
+        assert_eq!(std::fs::read(store.path()).unwrap(), original);
+    }
+
     use super::*;
     #[test]
     fn config_round_trip_is_atomic_and_readable() {

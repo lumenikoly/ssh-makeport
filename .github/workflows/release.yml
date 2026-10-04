@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'New release tag matching Cargo.toml (for example v0.2.0)'
+        description: 'New release tag matching Cargo.toml (for example v0.3.0)'
         required: true
-        default: v0.2.0
+        default: v0.3.0
         type: string
 
 concurrency:
@@ -21,6 +21,9 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '12.0'
 
 jobs:
+  check:
+    uses: ./.github/workflows/ci.yml
+
   prepare:
     runs-on: ubuntu-24.04
     outputs:
@@ -51,7 +54,7 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: prepare
+    needs: [prepare, check]
     strategy:
       fail-fast: false
       matrix:
@@ -75,8 +78,6 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -86,19 +87,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - name: Test application and offline integration
-        run: cargo test --all-targets --locked
-      - name: Test shell, PTY, packaging and release helpers
-        if: runner.os != 'Windows'
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
-      - name: Test packaging and release helpers on Windows
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          python -m unittest discover -s tests -p 'test_packaging.py' -v
-          python -m unittest discover -s tests -p 'test_release.py' -v
-      - name: Check all targets
-        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Build desktop application
         run: cargo build --release --locked
       - name: Sign macOS executable locally
