@@ -3,6 +3,7 @@ Type=Application
 Name=MakePort
 Comment=Remote Make tasks and SSH tunnels
 Exec=makeport
+Icon=makeport
 Terminal=false
 Categories=Development;Utility;
 StartupNotify=true

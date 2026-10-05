@@ -3,6 +3,7 @@
 
 use makeport::engine::{self, Action, View};
 use makeport::model::{unique_id, Draft, ManualPort};
+use slint::winit_030::WinitWindowAccessor;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,6 +16,121 @@ mod generated {
     slint::include_modules!();
 }
 use generated::*;
+
+fn show_window(ui: &MainWindow) {
+    ui.window().set_minimized(false);
+    if let Err(error) = ui.show() {
+        ui.set_notice(format!("Не удалось открыть окно: {error}").into());
+    }
+    ui.window()
+        .with_winit_window(|window| window.focus_window());
+}
+
+fn finish(ui: &MainWindow, tx: &SyncSender<Action>) {
+    match tx.try_send(Action::Quit) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            let _ = slint::quit_event_loop();
+        }
+        Err(error) => ui.set_notice(format!("Закрытие пока не выполнено: {error}").into()),
+    }
+}
+
+fn request_quit(ui: &MainWindow, tx: &SyncSender<Action>) {
+    if ui.get_quitting() {
+        return;
+    }
+    if ui.get_total_running() > 0 {
+        show_window(ui);
+        ui.set_confirm_kind("quit".into());
+    } else {
+        finish(ui, tx);
+    }
+}
+
+fn hide_to_tray(ui: &MainWindow) {
+    if ui.get_can_hide_to_tray() && !ui.get_quitting() {
+        if let Err(error) = ui.hide() {
+            ui.set_notice(format!("Не удалось свернуть окно: {error}").into());
+        }
+    }
+}
+
+fn create_tray(ui: &MainWindow, tx: &SyncSender<Action>) -> Result<AppTray, slint::PlatformError> {
+    let tray = AppTray::new()?;
+    let weak = ui.as_weak();
+    tray.on_open_window(move || {
+        if let Some(ui) = weak.upgrade() {
+            show_window(&ui);
+        }
+    });
+    let weak = ui.as_weak();
+    let tx = tx.clone();
+    tray.on_exit(move || {
+        if let Some(ui) = weak.upgrade() {
+            request_quit(&ui, &tx);
+        }
+    });
+    Ok(tray)
+}
+
+fn tray_status(view: &View) -> SharedString {
+    let connected = view
+        .project_states
+        .iter()
+        .filter(|s| s.starts_with("Подключён"))
+        .count();
+    format!(
+        "Проектов подключено: {connected} · Задач работает: {}",
+        view.total_running
+    )
+    .into()
+}
+
+// Linux shells may not expose a tray at all. Check outside the UI thread and
+// restore a hidden window if its tray host disappears (for example an extension
+// is disabled). Never leave the user with an inaccessible running application.
+#[cfg(target_os = "linux")]
+fn monitor_tray() -> (
+    std::sync::mpsc::Receiver<bool>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let (status_tx, status_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let mut connection = None;
+        loop {
+            if connection.is_none() {
+                connection = zbus::blocking::connection::Builder::session()
+                    .and_then(|b| b.method_timeout(Duration::from_secs(2)).build())
+                    .ok();
+            }
+            let available = connection.as_ref().is_some_and(|connection| {
+                zbus::blocking::Proxy::new(
+                    connection,
+                    "org.kde.StatusNotifierWatcher",
+                    "/StatusNotifierWatcher",
+                    "org.kde.StatusNotifierWatcher",
+                )
+                .and_then(|proxy| proxy.get_property::<bool>("IsStatusNotifierHostRegistered"))
+                .unwrap_or(false)
+            });
+            if !available {
+                connection = None;
+            }
+            if status_tx.send(available).is_err()
+                || !matches!(
+                    stop_rx.recv_timeout(Duration::from_secs(3)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                )
+            {
+                break;
+            }
+        }
+    });
+    (status_rx, stop_tx, thread)
+}
 
 fn parse_manual_port(local: &str, remote: &str, description: &str) -> makeport::Result<ManualPort> {
     let remote = remote
@@ -223,6 +339,9 @@ fn apply(ui: &MainWindow, view: &View, previous: &View) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
+    ui.set_can_hide_to_tray(cfg!(any(target_os = "windows", target_os = "macos")));
+    #[cfg(target_os = "linux")]
+    let (tray_status, tray_stop, tray_thread) = monitor_tray();
     ui.window().set_size(slint::LogicalSize::new(1020.0, 740.0));
     ui.set_mono_font(
         if cfg!(target_os = "macos") {
@@ -235,6 +354,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into(),
     );
     let backend = engine::start();
+    let tray = Rc::new(RefCell::new(if ui.get_can_hide_to_tray() {
+        match create_tray(&ui, &backend.actions) {
+            Ok(tray) => Some(tray),
+            Err(error) => {
+                ui.set_can_hide_to_tray(false);
+                ui.set_notice(format!("Трей недоступен: {error}").into());
+                None
+            }
+        }
+    } else {
+        None
+    }));
     let state = Rc::new(RefCell::new(View::default()));
 
     macro_rules! action0 {
@@ -264,7 +395,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     action0!(on_open_config, Action::OpenConfig);
     action0!(on_dismiss_notice, Action::DismissNotice);
     action0!(on_delete_project, Action::Delete);
-    action0!(on_quit, Action::Quit);
+    {
+        let weak = ui.as_weak();
+        let tx = backend.actions.clone();
+        ui.on_quit(move || {
+            if let Some(ui) = weak.upgrade() {
+                finish(&ui, &tx);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let tx = backend.actions.clone();
+        ui.on_request_quit(move || {
+            if let Some(ui) = weak.upgrade() {
+                request_quit(&ui, &tx);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_hide_to_tray(move || {
+            if let Some(ui) = weak.upgrade() {
+                hide_to_tray(&ui);
+            }
+        });
+    }
     action_string!(on_run_target, Action::Run);
     action_string!(on_stop_target, Action::Stop);
     action_string!(on_reset_target, Action::Reset);
@@ -397,30 +553,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tx = backend.actions.clone();
         ui.window().on_close_requested(move || {
             if let Some(ui) = weak.upgrade() {
-                if !ui.get_quitting() {
-                    if ui.get_total_running() > 0 {
-                        ui.set_confirm_kind("quit".into());
-                    } else {
-                        match tx.try_send(Action::Quit) {
-                            Ok(()) => {}
-                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                return slint::CloseRequestResponse::HideWindow;
-                            }
-                            Err(error) => {
-                                ui.set_notice(format!("Закрытие пока не выполнено: {error}").into())
-                            }
-                        }
-                    }
+                if ui.get_can_hide_to_tray() && !ui.get_quitting() {
+                    return slint::CloseRequestResponse::HideWindow;
                 }
+                request_quit(&ui, &tx);
             }
             slint::CloseRequestResponse::KeepWindowShown
         });
     }
     let timer = slint::Timer::default();
     let weak = ui.as_weak();
+    let tray = tray.clone();
+    #[cfg(target_os = "linux")]
+    let tx = backend.actions.clone();
     let views = backend.views;
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
         let Some(ui) = weak.upgrade() else { return; };
+        #[cfg(target_os = "linux")]
+        for available in tray_status.try_iter() {
+            if !available && ui.get_can_hide_to_tray() && !ui.window().is_visible() {
+                show_window(&ui);
+                ui.set_notice("Системный трей недоступен. Окно восстановлено; подключения продолжают работать.".into());
+            }
+            if available && tray.borrow().is_none() {
+                match create_tray(&ui, &tx) {
+                    Ok(icon) => *tray.borrow_mut() = Some(icon),
+                    Err(error) => ui.set_notice(format!("Трей недоступен: {error}").into()),
+                }
+            } else if !available {
+                tray.borrow_mut().take();
+            }
+            ui.set_can_hide_to_tray(available && tray.borrow().is_some());
+        }
+        if ui.get_can_hide_to_tray() && ui.window().is_visible() && ui.window().is_minimized() {
+            hide_to_tray(&ui);
+        }
         let mut latest = None;
         let mut disconnected = false;
         loop {
@@ -444,9 +611,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_total_running(0);
             ui.set_fatal(true);
         }
+        if let Some(tray) = tray.borrow().as_ref() {
+            tray.set_status(tray_status(&state.borrow()));
+            tray.set_quitting(ui.get_quitting());
+        }
     });
     let result = ui.run();
     timer.stop();
+    #[cfg(target_os = "linux")]
+    {
+        let _ = tray_stop.send(());
+        let _ = tray_thread.join();
+    }
     // Covers an unexpected GUI event-loop exit as well as the normal close flow.
     let _ = backend.actions.send(Action::Quit);
     drop(timer);
@@ -541,6 +717,8 @@ mod tests {
         assert_eq!(draft(&ui).into_project().unwrap(), project);
         let view = View {
             projects: vec![project],
+            project_states: vec!["Подключён · задач: 1".into()],
+            total_running: 1,
             selected: Some(0),
             connected: true,
             ports: vec![makeport::model::Forward {
@@ -568,5 +746,24 @@ mod tests {
         );
         assert_eq!(ui.get_tasks().row_data(0).unwrap().state, "Работает");
         assert!(!ui.get_show_log());
+        assert_eq!(
+            tray_status(&view),
+            "Проектов подключено: 1 · Задач работает: 1"
+        );
+
+        ui.set_can_hide_to_tray(true);
+        hide_to_tray(&ui);
+        assert!(!ui.window().is_visible());
+        assert_eq!(ui.get_tasks().row_data(0).unwrap().state, "Работает");
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        ui.set_total_running(1);
+        request_quit(&ui, &tx);
+        assert!(ui.window().is_visible());
+        assert_eq!(ui.get_confirm_kind(), "quit");
+        assert!(rx.try_recv().is_err());
+        ui.set_confirm_kind("".into());
+        ui.set_total_running(0);
+        request_quit(&ui, &tx);
+        assert!(matches!(rx.try_recv().unwrap(), Action::Quit));
     }
 }

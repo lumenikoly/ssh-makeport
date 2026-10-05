@@ -156,6 +156,7 @@ component Field inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "MakePort";
+    icon: @image-url("../assets/makeport.png");
     init => { Palette.color-scheme = ColorScheme.light; }
     preferred-width: 1020px; preferred-height: 740px;
     min-width: 720px; min-height: 540px;
@@ -184,6 +185,7 @@ export component MainWindow inherits Window {
     in-out property <string> notice;
     in property <bool> fatal;
     in property <bool> quitting;
+    in property <bool> can-hide-to-tray;
     in property <string> mono-font: "monospace";
 
     in-out property <bool> editing: false;
@@ -225,6 +227,8 @@ export component MainWindow inherits Window {
     callback open-config();
     callback dismiss-notice();
     callback quit();
+    callback hide-to-tray();
+    callback request-quit();
     callback scroll-log();
 
     public function focus-editor() { host-field.focus-field(); }
@@ -306,7 +310,21 @@ export component MainWindow inherits Window {
                         enabled: root.can-add && root.interactive;
                         clicked => { root.new-project(); }
                     }
-                    Text { text: "Подключения работают,\nпока MakePort открыт."; color: #7d9ca5; font-size: 10px; wrap: word-wrap; }
+                    if root.can-hide-to-tray: ActionButton {
+                        text: "В трей"; icon: @image-url("icons/tray.svg");
+                        accessible-name: "Свернуть в трей — подключения продолжат работать";
+                        enabled: !root.quitting;
+                        clicked => { root.hide-to-tray(); }
+                    }
+                    HorizontalLayout {
+                        Text { text: "Работает\nи в фоне"; color: #7d9ca5; font-size: 10px; vertical-alignment: center; }
+                        ActionButton {
+                            text: "Выход";
+                            accessible-name: "Завершить MakePort";
+                            enabled: !root.quitting;
+                            clicked => { root.request-quit(); }
+                        }
+                    }
                 }
             }
             Rectangle {
@@ -598,5 +616,21 @@ export component MainWindow inherits Window {
             border-radius: 8px; background: Theme.sidebar;
             Text { text: root.copy-message; color: white; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
         }
+    }
+}
+
+export component AppTray inherits SystemTrayIcon {
+    icon: @image-url("../assets/makeport.png");
+    tooltip: "MakePort — " + root.status;
+    in property <string> status: "MakePort работает";
+    in property <bool> quitting;
+    callback open-window();
+    callback exit();
+    clicked => { root.open-window(); }
+    Menu {
+        MenuItem { title: "Открыть MakePort"; activated => { root.open-window(); } }
+        MenuItem { title: root.status; enabled: false; }
+        MenuSeparator {}
+        MenuItem { title: root.quitting ? "Завершение…" : "Завершить MakePort"; enabled: !root.quitting; activated => { root.exit(); } }
     }
 }

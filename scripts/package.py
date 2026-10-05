@@ -33,12 +33,14 @@ def package(binary: Path, system: str, architecture: str, output: Path) -> Path:
         shutil.copy2(binary, executable)
         executable.chmod(0o755)
         (contents / "Resources").mkdir()
+        shutil.copy2(ROOT / "assets" / "makeport.icns", contents / "Resources" / "makeport.icns")
         version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
         info = {
             "CFBundleExecutable": "makeport",
             "CFBundleIdentifier": "app.makeport.desktop",
             "CFBundleName": "MakePort",
             "CFBundleDisplayName": "MakePort",
+            "CFBundleIconFile": "makeport.icns",
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": version,
             "CFBundleVersion": version,
@@ -55,6 +57,7 @@ def package(binary: Path, system: str, architecture: str, output: Path) -> Path:
         if system != "windows":
             executable.chmod(0o755)
             shutil.copy2(ROOT / "packaging" / "makeport.desktop", stage / "makeport.desktop")
+            shutil.copy2(ROOT / "assets" / "makeport.png", stage / "makeport.png")
     archive = output / f"{name}.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as target:
         for file in sorted(stage.rglob("*")):
