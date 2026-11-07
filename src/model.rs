@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MAX_PROJECTS: usize = 64;
 pub const MAX_TASKS: usize = 128;
 pub const MAX_RUNNING: usize = 8;
-pub const MAX_PORTS: usize = 32;
+pub const MAX_PORTS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,14 +42,16 @@ pub struct RunRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
-    #[serde(default)]
-    pub manual_ports: Vec<ManualPort>,
+    // Read-only compatibility with profiles created before the unified config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual_ports: Vec<Port>,
     pub id: String,
     pub name: String,
     pub host: String,
+    #[serde(default = "home")]
     pub path: String,
     #[serde(default)]
-    pub ports: Vec<Forward>,
+    pub ports: Vec<Port>,
     #[serde(default)]
     pub tasks: Vec<String>,
     #[serde(default = "yes")]
@@ -58,6 +60,10 @@ pub struct Project {
 
 fn yes() -> bool {
     true
+}
+
+fn home() -> String {
+    "~".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,12 +75,13 @@ pub struct Forward {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ManualPort {
+pub struct Port {
     pub local: u16,
     pub remote: u16,
+    #[serde(default)]
     pub description: String,
 }
-impl ManualPort {
+impl Port {
     pub fn forward(&self) -> Forward {
         Forward {
             local: self.local,
@@ -85,10 +92,7 @@ impl ManualPort {
         if self.local == 0 || self.remote == 0 {
             return Err("Порт должен быть от 1 до 65535".into());
         }
-        if self.description.trim().is_empty()
-            || self.description.len() > 500
-            || self.description.chars().any(char::is_control)
-        {
+        if self.description.len() > 500 || self.description.chars().any(char::is_control) {
             return Err("Укажите описание длиной до 500 байт без переносов строк".into());
         }
         Ok(())
@@ -127,8 +131,19 @@ impl Draft {
             },
             name: self.name.trim().to_owned(),
             host: self.host.trim().to_owned(),
-            path: self.path.trim().to_owned(),
-            ports: parse_ports(&self.ports)?,
+            path: if self.path.trim().is_empty() {
+                home()
+            } else {
+                self.path.trim().to_owned()
+            },
+            ports: parse_ports(&self.ports)?
+                .into_iter()
+                .map(|p| Port {
+                    local: p.local,
+                    remote: p.remote,
+                    description: String::new(),
+                })
+                .collect(),
             tasks: parse_tasks(&self.tasks)?,
             reconnect: self.reconnect,
         };
@@ -157,6 +172,12 @@ impl From<&Project> for Draft {
 }
 
 impl Config {
+    pub fn migrate(&mut self) {
+        for project in &mut self.projects {
+            project.ports.append(&mut project.manual_ports);
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.version != 1 {
             return Err("Неизвестная версия конфигурации".into());
@@ -206,13 +227,11 @@ impl Project {
         validate_host(&self.host)?;
         validate_path(&self.path)?;
         if self.ports.len() + self.manual_ports.len() > MAX_PORTS {
-            return Err("Допускается не более 32 туннелей".into());
+            return Err(format!("Допускается не более {MAX_PORTS} туннелей"));
         }
         let mut locals = HashSet::new();
         for port in &self.ports {
-            if port.local == 0 || port.remote == 0 {
-                return Err("Порт должен быть от 1 до 65535".into());
-            }
+            port.validate()?;
             if !locals.insert(port.local) {
                 return Err(format!("Локальный порт {} указан дважды", port.local));
             }
@@ -293,17 +312,38 @@ pub fn parse_ports(input: &str) -> Result<Vec<Forward>> {
                 .filter(|p| *p != 0)
                 .ok_or_else(|| format!("Некорректный порт: {value}"))
         };
-        let port = Forward {
-            local: parse(left)?,
-            remote: parse(right)?,
+        let range = |text: &str| -> Result<(u16, u16)> {
+            let (start, end) = text.split_once('-').unwrap_or((text, text));
+            let (start, end) = (parse(start)?, parse(end)?);
+            if start > end {
+                return Err(format!("Обратный диапазон портов: {text}"));
+            }
+            Ok((start, end))
         };
-        if !used.insert(port.local) {
-            return Err(format!("Порт {} указан дважды", port.local));
+        let (local, local_end) = range(left)?;
+        let (remote, remote_end) = range(right)?;
+        if local_end - local != remote_end - remote {
+            return Err(
+                "Диапазоны локальных и удалённых портов должны быть одинаковой длины".into(),
+            );
         }
-        ports.push(port);
+        let count = usize::from(local_end - local) + 1;
+        if ports.len() + count > MAX_PORTS {
+            return Err(format!("Допускается не более {MAX_PORTS} туннелей"));
+        }
+        for offset in 0..count as u16 {
+            let port = Forward {
+                local: local + offset,
+                remote: remote + offset,
+            };
+            if !used.insert(port.local) {
+                return Err(format!("Порт {} указан дважды", port.local));
+            }
+            ports.push(port);
+        }
     }
     if ports.len() > MAX_PORTS {
-        return Err("Допускается не более 32 туннелей".into());
+        return Err(format!("Допускается не более {MAX_PORTS} туннелей"));
     }
     Ok(ports)
 }
@@ -346,7 +386,7 @@ mod tests {
     fn profiles_from_v02_load_and_validate_manual_port_extensions() {
         let mut project: super::Project = toml::from_str("id='legacy'\nname='Legacy'\nhost='devbox'\npath='~/project'\nports=[{local=5173,remote=5173}]\ntasks=['dev']\nreconnect=true\n").unwrap();
         assert!(project.manual_ports.is_empty());
-        project.manual_ports.push(super::ManualPort {
+        project.manual_ports.push(super::Port {
             local: 15432,
             remote: 5432,
             description: "Database".into(),
@@ -381,9 +421,34 @@ mod tests {
     }
     #[test]
     fn rejects_invalid_ports() {
-        for input in ["0", "65536", "a", "1:2:3", "5173,5173:80", "-1"] {
+        for input in [
+            "0",
+            "65536",
+            "a",
+            "1:2:3",
+            "5173,5173:80",
+            "-1",
+            "3-1",
+            "1-3:5-6",
+            "1-65535",
+            "1-3,3",
+        ] {
             assert!(parse_ports(input).is_err(), "{input}");
         }
+    }
+    #[test]
+    fn expands_port_ranges_with_mapping_and_limits() {
+        let ports = parse_ports("13000-13255:3000-3255").unwrap();
+        assert_eq!(ports.len(), MAX_PORTS);
+        assert_eq!(
+            ports.last(),
+            Some(&Forward {
+                local: 13255,
+                remote: 3255
+            })
+        );
+        assert_eq!(parse_ports("65534-65535").unwrap().len(), 2);
+        assert!(parse_ports("1-257").is_err());
     }
     #[test]
     fn rejects_option_and_shell_injection() {

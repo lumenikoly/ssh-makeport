@@ -5,7 +5,7 @@ export struct TaskItem {
     name: string, title: string, description: string, state: string,
     active: bool, can-run: bool, can-stop: bool, unknown: bool,
 }
-export struct PortItem { local: int, remote: int, mapping: string, detail: string, state: string, manual: bool, can-open: bool }
+export struct PortItem { local: int, remote: int, mapping: string, detail: string, state: string, can-open: bool }
 
 global Theme {
     out property <color> canvas: #f7f9f9;
@@ -39,7 +39,7 @@ component ActionButton inherits Rectangle {
     accessible-enabled: root.enabled;
     Tooltip {
         Rectangle { background: Theme.sidebar; border-radius: 5px;
-            HorizontalLayout { padding: 8px; Text { text: root.enabled ? root.accessible-name : ""; color: white; font-size: 12px; } }
+            HorizontalLayout { padding: 8px; Text { text: root.accessible-name; color: white; font-size: 12px; } }
         }
     }
     accessible-action-default => { if root.enabled { focus.focus(); root.clicked(); } }
@@ -173,12 +173,12 @@ export component MainWindow inherits Window {
     in property <bool> desired;
     in property <bool> can-change;
     in property <bool> can-add;
+    in property <bool> can-reload;
     in property <bool> can-manage-ports;
     in property <int> total-running;
     in property <bool> can-connect;
     in property <int> running;
     in property <string> next-action;
-    in property <bool> discovering;
     in-out property <bool> show-log: false;
     in property <string> log-name;
     in property <string> log-text;
@@ -201,15 +201,14 @@ export component MainWindow inherits Window {
     in-out property <string> confirm-kind;
     in-out property <string> confirm-target;
     in-out property <bool> follow-log: true;
-    in-out property <bool> adding-port: false;
-    in-out property <string> port-remote;
-    in-out property <string> port-local;
-    in-out property <string> port-description;
+    in-out property <bool> settings-open: false;
+    in-out property <bool> edit-advanced: false;
+    in-out property <bool> show-tasks: false;
+    in-out property <string> port-input;
     in-out property <string> port-error;
-    callback add-port(string, string, string);
+    callback add-ports(string);
     callback remove-port(int);
-    callback retry-port(int);
-    private property <bool> interactive: !root.editing && !root.adding-port && !root.show-log && root.confirm-kind == "" && !root.quitting;
+    private property <bool> interactive: !root.editing && !root.settings-open && !root.show-log && root.confirm-kind == "" && !root.quitting;
 
     callback select-project(int);
     callback new-project();
@@ -232,7 +231,6 @@ export component MainWindow inherits Window {
     callback scroll-log();
 
     public function focus-editor() { host-field.focus-field(); }
-    public function focus-port() { remote-field.focus-field(); }
     changed confirm-kind => { if root.confirm-kind != "" { confirm-cancel.focus(); } }
     changed show-log => { if root.show-log { root.follow-log = true; root.scroll-log(); } }
     private property <string> copy-message;
@@ -247,7 +245,7 @@ export component MainWindow inherits Window {
             if event.text == Key.Escape {
                 if root.confirm-kind != "" { root.confirm-kind = ""; }
                 else if root.editing { root.editing = false; }
-                else if root.adding-port { root.adding-port = false; }
+                else if root.settings-open { root.settings-open = false; }
                 else if root.show-log { root.show-log = false; }
                 return accept;
             }
@@ -259,7 +257,7 @@ export component MainWindow inherits Window {
                 width: 184px; horizontal-stretch: 0;
                 background: Theme.sidebar;
                 VerticalLayout {
-                    padding: 16px; padding-top: 26px; spacing: 22px;
+                    padding: 16px; padding-top: 26px; spacing: 14px;
                     HorizontalLayout {
                         spacing: 10px;
                         Rectangle {
@@ -269,13 +267,13 @@ export component MainWindow inherits Window {
                         }
                         Text { text: "MakePort"; color: white; font-size: 19px; font-weight: 600; vertical-alignment: center; }
                     }
-                    Text { text: "ПРОЕКТЫ"; color: #7d9ca5; font-size: 10px; letter-spacing: 1px; height: 18px; }
+                    Text { text: "ПОДКЛЮЧЕНИЯ"; color: #7d9ca5; font-size: 10px; letter-spacing: 1px; height: 18px; }
                     ScrollView {
                         vertical-stretch: 1;
                         VerticalLayout {
                             spacing: 6px;
                             for project[index] in root.projects: Rectangle {
-                                height: 86px; border-radius: 9px;
+                                height: 78px; border-radius: 9px;
                                 background: root.selected == index ? #27464e : project-touch.has-hover ? #1c3a43 : transparent;
                                 border-width: project-focus.has-focus ? 1px : 0px; border-color: #74c0ad;
                                 accessible-role: button; accessible-label: project.title + ", " + project.location + ", " + project.state;
@@ -306,24 +304,14 @@ export component MainWindow inherits Window {
                         }
                     }
                     new-project-button := ActionButton {
-                        text: "Новый проект"; icon: @image-url("icons/plus.svg");
+                        text: "Добавить"; icon: @image-url("icons/plus.svg");
+                        accessible-name: "Добавить подключение";
                         enabled: root.can-add && root.interactive;
                         clicked => { root.new-project(); }
                     }
-                    if root.can-hide-to-tray: ActionButton {
-                        text: "В трей"; icon: @image-url("icons/tray.svg");
-                        accessible-name: "Свернуть в трей — подключения продолжат работать";
-                        enabled: !root.quitting;
-                        clicked => { root.hide-to-tray(); }
-                    }
-                    HorizontalLayout {
-                        Text { text: "Работает\nи в фоне"; color: #7d9ca5; font-size: 10px; vertical-alignment: center; }
-                        ActionButton {
-                            text: "Выход";
-                            accessible-name: "Завершить MakePort";
-                            enabled: !root.quitting;
-                            clicked => { root.request-quit(); }
-                        }
+                    ActionButton {
+                        text: "Настройки"; icon: @image-url("icons/settings.svg");
+                        enabled: root.interactive; clicked => { root.settings-open = true; }
                     }
                 }
             }
@@ -338,10 +326,9 @@ export component MainWindow inherits Window {
                             horizontal-stretch: 0; vertical-stretch: 0;
                             Image { x: 20px; y: 20px; width: 32px; height: 32px; source: @image-url("icons/server.svg"); colorize: Theme.accent; }
                         }
-                        Heading { text: "Ваш проект.\nНа любом сервере."; font-size: 32px; }
-                        Text { text: "Подключитесь по SSH, откройте нужные порты\nи запускайте задачи в одном окне."; color: Theme.muted; font-size: 15px; wrap: word-wrap; }
-                        ActionButton { text: "Подключить проект"; primary: true; icon: @image-url("icons/plus.svg"); enabled: root.can-add && root.interactive; clicked => { root.new-project(); } }
-                        Text { text: "Достаточно адреса сервера и пути к папке."; color: Theme.muted; font-size: 12px; }
+                        Heading { text: "Ваши порты.\nНа любом сервере."; font-size: 32px; }
+                        Text { text: "Укажите сервер и порты.\nMakePort подключит их к этому компьютеру."; color: Theme.muted; font-size: 15px; wrap: word-wrap; }
+                        ActionButton { text: "Добавить подключение"; primary: true; icon: @image-url("icons/plus.svg"); enabled: root.can-add && root.interactive; clicked => { root.new-project(); } }
                         Rectangle { vertical-stretch: 1; }
                     }
                     if root.selected >= 0: VerticalLayout {
@@ -349,23 +336,16 @@ export component MainWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             Heading { text: root.project-name; font-size: 28px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
-                            ActionButton { icon: @image-url("icons/settings.svg"); accessible-name: "Настройки проекта"; quiet: true; enabled: root.can-change && root.interactive; clicked => { root.edit-project(); } }
+                            ActionButton { text: "Изменить"; accessible-name: root.can-change ? "Изменить подключение" : "Отключите соединение, чтобы изменить сервер и список портов"; quiet: true; enabled: root.can-change && root.interactive; clicked => { root.edit-project(); } }
                             ActionButton {
-                                text: root.desired ? "Отключить" : "Подключить"; primary: !root.desired;
+                                text: root.desired ? (root.connected ? "Отключить" : "Отменить") : root.connection == "Ошибка подключения" ? "Повторить" : "Подключить"; primary: !root.desired;
                                 enabled: root.can-connect && root.interactive;
-                                clicked => { if root.running > 0 { root.confirm-kind = "disconnect"; } else { root.toggle-connection(); } }
+                                clicked => { if root.desired && root.running > 0 { root.confirm-kind = "disconnect"; } else { root.toggle-connection(); } }
                             }
-                        }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Image { source: @image-url("icons/folder.svg"); width: 16px; height: 16px; colorize: Theme.muted; horizontal-stretch: 0; vertical-stretch: 0; }
-                            Text { text: root.project-location; overflow: elide; color: Theme.muted; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; }
-                            ActionButton { icon: @image-url("icons/copy.svg"); accessible-name: "Копировать адрес проекта"; quiet: true; height: 28px; enabled: root.interactive; clicked => { root.copy-value(root.project-location); } }
                         }
                         HorizontalLayout {
                             spacing: 10px;
                             Status { text: root.connection; tone: root.connected ? 1 : root.connection == "Ошибка подключения" ? 2 : root.desired ? 3 : 0; }
-                            Text { text: root.running > 0 ? "Задач в работе: " + root.running : ""; font-size: 11px; color: Theme.muted; vertical-alignment: center; }
                             Rectangle { horizontal-stretch: 1; }
                         }
                     }
@@ -387,91 +367,86 @@ export component MainWindow inherits Window {
                                 Heading { text: "Порты"; vertical-alignment: center; }
                                 Text { text: root.ports.length == 0 ? "" : root.ports.length; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
                                 Rectangle { horizontal-stretch: 1; }
-                                ActionButton { text: "Добавить"; icon: @image-url("icons/plus.svg"); quiet: true; enabled: root.can-manage-ports && root.interactive; clicked => {
-                                    root.port-remote = ""; root.port-local = ""; root.port-description = ""; root.port-error = ""; root.adding-port = true; root.focus-port();
-                                } }
                             }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                port-field := Field {
+                                    text <=> root.port-input; label: "Добавить порты";
+                                    placeholder: "3000, 15432:5432, 8000-8010";
+                                    enabled: root.can-manage-ports && root.interactive;
+                                    accepted => { root.add-ports(root.port-input); }
+                                }
+                                ActionButton { text: "Добавить"; enabled: root.can-manage-ports && root.interactive && root.port-input != ""; clicked => { root.add-ports(root.port-input); } }
+                            }
+                            if root.port-error != "": Text { text: root.port-error; color: #b2534a; wrap: word-wrap; font-size: 12px; }
                             if root.ports.length == 0: Rectangle {
                                 height: 82px; background: Theme.surface; border-radius: 10px; border-width: 1px; border-color: Theme.line;
                                 VerticalLayout { padding: 16px; spacing: 5px;
                                     Text { text: "Портов пока нет"; color: Theme.ink; font-weight: 500; }
-                                    Text { text: "Добавьте порт, чтобы открыть сервис с сервера на этом компьютере."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                                    Text { text: "Введите порт выше. Например, 3000 или 15432:5432."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
                                 }
                             }
                             for port in root.ports: Rectangle {
-                                height: 82px; background: Theme.surface; border-radius: 10px; border-width: 1px; border-color: Theme.line;
+                                height: 64px; background: Theme.surface; border-radius: 10px; border-width: 1px; border-color: Theme.line;
                                 HorizontalLayout {
                                     padding: 12px; spacing: 8px;
                                     VerticalLayout {
                                         horizontal-stretch: 1; spacing: 4px;
-                                        Heading { text: port.detail; font-size: 14px; overflow: elide; }
-                                        Text { text: port.mapping + "  ←  сервер:" + port.remote; color: Theme.muted; font-size: 12px; overflow: elide; }
-                                        HorizontalLayout {
-                                            spacing: 8px;
-                                            Text { text: port.state == "Проброшен" ? "● Подключён" : "● " + port.state; font-size: 10px; color: port.can-open ? #39815f : port.state == "Ошибка" ? #b2534a : Theme.muted; }
-                                            if port.manual: Text { text: "Вручную"; font-size: 10px; color: Theme.muted; }
-                                            Rectangle { horizontal-stretch: 1; }
-                                        }
+                                        Heading { text: port.mapping; font-size: 14px; overflow: elide; }
+                                        Text { text: (port.detail == "Порт " + port.remote ? "На сервере: " : port.detail + " · на сервере: ") + port.remote; color: Theme.muted; font-size: 12px; overflow: elide; }
                                     }
                                     ActionButton { icon: @image-url("icons/copy.svg"); accessible-name: "Копировать адрес порта " + port.local; quiet: true; enabled: root.interactive; clicked => { root.copy-value("http://localhost:" + port.local); } }
                                     ActionButton {
-                                        text: port.manual && port.state == "Ошибка" ? "Повторить" : "Открыть";
-                                        icon: port.manual && port.state == "Ошибка" ? @image-url("icons/refresh.svg") : @image-url("icons/external.svg");
-                                        enabled: root.interactive && (port.can-open || (port.manual && port.state == "Ошибка" && root.connected));
-                                        clicked => { if port.manual && port.state == "Ошибка" { root.retry-port(port.local); } else { root.open-port(port.local); } }
+                                        text: "Открыть";
+                                        icon: @image-url("icons/external.svg");
+                                        enabled: root.interactive && port.can-open;
+                                        clicked => { root.open-port(port.local); }
                                     }
-                                    if port.manual: ActionButton { icon: @image-url("icons/close.svg"); accessible-name: "Удалить ручной порт " + port.local; quiet: true; enabled: root.can-manage-ports && root.interactive; clicked => { root.remove-port(port.local); } }
+                                    ActionButton { icon: @image-url("icons/close.svg"); accessible-name: "Удалить порт " + port.local; quiet: true; enabled: root.can-manage-ports && root.interactive; clicked => { root.remove-port(port.local); } }
                                 }
                             }
-                            HorizontalLayout {
-                                padding-top: 14px;
-                                Heading { text: "Задачи"; vertical-alignment: center; }
+                            if root.tasks.length > 0: HorizontalLayout {
+                                padding-top: 12px;
+                                ActionButton {
+                                    text: (root.show-tasks ? "Скрыть задачи Make" : "Задачи Make · " + root.tasks.length) + (root.running > 0 ? " · работают: " + root.running : "");
+                                    quiet: true; enabled: root.interactive;
+                                    clicked => { root.show-tasks = !root.show-tasks; }
+                                }
                                 Rectangle { horizontal-stretch: 1; }
-                                Text { text: root.discovering ? "Загружаем…" : ""; font-size: 12px; color: Theme.muted; vertical-alignment: center; }
                             }
-                            for task in root.tasks: Rectangle {
-                                height: 74px; background: Theme.surface; border-radius: 10px; border-width: 1px; border-color: Theme.line;
-                                HorizontalLayout {
-                                    padding: 12px; spacing: 8px;
-                                    VerticalLayout {
-                                        horizontal-stretch: 1; spacing: 4px;
-                                        Heading { text: task.title; font-size: 14px; overflow: elide; }
-                                        HorizontalLayout {
-                                            spacing: 8px;
-                                            Status { text: task.state; tone: task.unknown ? 3 : task.active || task.state == "Готово" ? 1 : task.state == "Готова" || task.state == "Остановлена" ? 0 : 2; }
-                                            if root.width >= 900px: Text { text: "make " + task.name; color: #94a2a7; font-size: 11px; vertical-alignment: center; }
-                                            Rectangle { horizontal-stretch: 1; }
+                            if root.show-tasks: VerticalLayout {
+                                spacing: 8px;
+                                for task in root.tasks: Rectangle {
+                                    height: 74px; background: Theme.surface; border-radius: 10px; border-width: 1px; border-color: Theme.line;
+                                    HorizontalLayout {
+                                        padding: 12px; spacing: 8px;
+                                        VerticalLayout {
+                                            horizontal-stretch: 1; spacing: 4px;
+                                            Heading { text: task.title; font-size: 14px; overflow: elide; }
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Status { text: task.state; tone: task.unknown ? 3 : task.active || task.state == "Готово" ? 1 : task.state == "Готова" || task.state == "Остановлена" ? 0 : 2; }
+                                                if root.width >= 900px: Text { text: "make " + task.name; color: #94a2a7; font-size: 11px; vertical-alignment: center; }
+                                                Rectangle { horizontal-stretch: 1; }
+                                            }
+                                        }
+                                        ActionButton { icon: @image-url("icons/log.svg"); accessible-name: "Журнал задачи " + task.title; quiet: true; enabled: root.interactive; clicked => { root.select-log(task.name); root.show-log = true; } }
+                                        ActionButton {
+                                            text: task.unknown ? "Проверить" : task.active ? "Остановить" : "Запустить";
+                                            icon: task.active ? @image-url("icons/stop.svg") : @image-url("icons/play.svg");
+                                            primary: !task.active && !task.unknown; danger: task.active;
+                                            enabled: root.interactive && (task.can-run || task.can-stop || task.unknown);
+                                            clicked => {
+                                                if task.unknown { root.confirm-target = task.name; root.confirm-kind = "reset"; }
+                                                else if task.active { root.stop-target(task.name); }
+                                                else { root.run-target(task.name); }
+                                            }
                                         }
                                     }
-                                    ActionButton { icon: @image-url("icons/log.svg"); accessible-name: "Журнал задачи " + task.title; quiet: true; enabled: root.interactive; clicked => { root.select-log(task.name); root.show-log = true; } }
-                                    ActionButton {
-                                        text: task.unknown ? "Проверить" : task.active ? "Остановить" : "Запустить";
-                                        icon: task.active ? @image-url("icons/stop.svg") : @image-url("icons/play.svg");
-                                        primary: !task.active && !task.unknown; danger: task.active;
-                                        enabled: root.interactive && (task.can-run || task.can-stop || task.unknown);
-                                        clicked => {
-                                            if task.unknown { root.confirm-target = task.name; root.confirm-kind = "reset"; }
-                                            else if task.active { root.stop-target(task.name); }
-                                            else { root.run-target(task.name); }
-                                        }
-                                    }
-                                }
-                            }
-                            if root.tasks.length == 0: Rectangle {
-                                height: 74px; background: Theme.surface; border-radius: 10px; border-width: 1px; border-color: Theme.line;
-                                VerticalLayout { padding: 16px; spacing: 5px;
-                                    Text { text: root.discovering ? "Загружаем задачи…" : root.connected ? "Задач пока нет" : "Задачи появятся после подключения"; color: Theme.ink; font-weight: 500; }
-                                    Text { text: root.connected ? "Добавьте действия в makeport.toml и обновите проект." : "Прочитаем действия из настроек проекта на сервере."; color: Theme.muted; wrap: word-wrap; font-size: 12px; }
                                 }
                             }
                             Rectangle { vertical-stretch: 1; }
                         }
-                    }
-                    if root.selected >= 0: HorizontalLayout {
-                        spacing: 8px;
-                        ActionButton { text: "Журнал"; icon: @image-url("icons/log.svg"); quiet: true; enabled: root.interactive; clicked => { root.select-log(""); root.show-log = true; } }
-                        Rectangle { horizontal-stretch: 1; }
-                        ActionButton { text: root.discovering ? "Обновляем…" : "Обновить"; icon: @image-url("icons/refresh.svg"); quiet: true; enabled: root.connected && !root.discovering && root.interactive; clicked => { root.refresh-tasks(); } }
                     }
                 }
             }
@@ -482,24 +457,36 @@ export component MainWindow inherits Window {
             FocusScope {
                 enabled: root.confirm-kind == "" && !root.quitting;
             Rectangle {
-                width: min(500px, parent.width - 48px); height: min(486px, parent.height - 32px);
+                width: min(500px, parent.width - 48px); height: min(root.edit-advanced ? 650px : 420px, parent.height - 32px);
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 background: Theme.surface; border-radius: 16px;
                 VerticalLayout {
                     padding: 28px; spacing: 12px;
                     HorizontalLayout {
-                        Heading { text: root.edit-is-new ? "Подключить проект" : "Настройки проекта"; font-size: 22px; horizontal-stretch: 1; }
+                        Heading { text: root.edit-is-new ? "Новое подключение" : "Изменить подключение"; font-size: 22px; horizontal-stretch: 1; }
                         ActionButton { icon: @image-url("icons/close.svg"); accessible-name: "Закрыть настройки"; quiet: true; clicked => { root.editing = false; } }
                     }
-                    Text { text: "Укажите сервер и папку, с которой хотите работать."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
-                    Text { text: "Сервер"; color: Theme.ink; font-size: 12px; font-weight: 500; }
-                    host-field := Field { text <=> root.edit-host; label: "Сервер"; placeholder: "dev-server или user@server"; enabled: root.confirm-kind == "" && !root.quitting; accepted => { path-field.focus-field(); } }
-                    Text { text: "Папка на сервере"; color: Theme.ink; font-size: 12px; font-weight: 500; }
-                    path-field := Field { text <=> root.edit-path; label: "Папка на сервере"; placeholder: "~/projects/site"; enabled: root.confirm-kind == "" && !root.quitting; accepted => { root.save-project(root.edit-is-new); } }
-                    Text { text: "Название · необязательно"; color: Theme.muted; font-size: 12px; }
-                    Field { text <=> root.edit-name; label: "Название проекта"; placeholder: "Например, рабочий сайт"; enabled: root.confirm-kind == "" && !root.quitting; accepted => { root.save-project(root.edit-is-new); } }
-                    Text { text: root.edit-error != "" ? root.edit-error : "Используем SSH-настройки и ключи этого компьютера."; color: root.edit-error != "" ? #b2534a : Theme.muted; font-size: 12px; wrap: word-wrap; }
-                    Rectangle { vertical-stretch: 1; }
+                    ScrollView {
+                        VerticalLayout { spacing: 10px;
+                            Text { text: "Сервер и порты — всё, что нужно для подключения."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                            Text { text: "Сервер"; color: Theme.ink; font-size: 12px; font-weight: 500; }
+                            host-field := Field { text <=> root.edit-host; label: "Сервер"; placeholder: "devbox или user@server"; accepted => { ports-field.focus-field(); } }
+                            Text { text: "Порты"; color: Theme.ink; font-size: 12px; font-weight: 500; }
+                            ports-field := Field { text <=> root.edit-ports; label: "Порты"; placeholder: "3000, 15432:5432, 8000-8010"; accepted => { root.save-project(root.edit-is-new); } }
+                            Text { text: "Формат: порт или локальный:серверный. Можно списком или диапазоном."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                            ActionButton { text: root.edit-advanced ? "Скрыть дополнительные настройки" : "Дополнительно"; quiet: true; clicked => { root.edit-advanced = !root.edit-advanced; } }
+                            if root.edit-advanced: VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "Название · необязательно"; color: Theme.muted; font-size: 12px; }
+                                Field { text <=> root.edit-name; label: "Название подключения"; placeholder: "Например, сервер разработки"; }
+                                Text { text: "Задачи Make · необязательно"; color: Theme.muted; font-size: 12px; }
+                                Field { text <=> root.edit-tasks; label: "Задачи Make"; placeholder: "dev, test, build"; }
+                                Text { text: "Папка для Make"; color: Theme.muted; font-size: 12px; }
+                                Field { text <=> root.edit-path; label: "Папка для Make"; placeholder: "~"; }
+                            }
+                            if root.edit-error != "": Text { text: root.edit-error; color: #b2534a; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
                     HorizontalLayout {
                         spacing: 8px;
                         if !root.edit-is-new: ActionButton { text: "Удалить"; danger: true; quiet: true; clicked => { root.confirm-kind = "delete"; root.editing = false; } }
@@ -512,44 +499,25 @@ export component MainWindow inherits Window {
             }
         }
         Rectangle {
-            visible: root.adding-port; background: #0c263877;
-            FocusScope {
-                enabled: root.confirm-kind == "" && !root.quitting;
+            visible: root.settings-open; background: #0c263877;
             Rectangle {
-                width: min(500px, parent.width - 48px); height: min(420px, parent.height - 32px);
+                width: min(400px, parent.width - 48px); height: min(root.can-hide-to-tray ? 460px : 410px, parent.height - 32px);
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 background: Theme.surface; border-radius: 16px;
                 VerticalLayout {
-                    padding: 28px; spacing: 12px;
+                    padding: 24px; spacing: 12px;
                     HorizontalLayout {
-                        Heading { text: "Добавить порт"; font-size: 22px; horizontal-stretch: 1; }
-                        ActionButton { icon: @image-url("icons/close.svg"); accessible-name: "Закрыть добавление порта"; quiet: true; clicked => { root.adding-port = false; } }
+                        Heading { text: "Настройки"; font-size: 22px; horizontal-stretch: 1; }
+                        ActionButton { icon: @image-url("icons/close.svg"); accessible-name: "Закрыть настройки"; quiet: true; clicked => { root.settings-open = false; } }
                     }
-                    Text { text: "Сервис с сервера станет доступен на этом компьютере."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
-                    HorizontalLayout {
-                        spacing: 16px;
-                        VerticalLayout { spacing: 7px;
-                            Text { text: "Порт на сервере"; color: Theme.ink; font-size: 12px; font-weight: 500; }
-                            remote-field := Field { text <=> root.port-remote; label: "Порт на сервере"; placeholder: "Например, 5173"; enabled: root.confirm-kind == "" && !root.quitting; accepted => { local-field.focus-field(); } }
-                        }
-                        VerticalLayout { spacing: 7px;
-                            Text { text: "Порт на компьютере"; color: Theme.ink; font-size: 12px; font-weight: 500; }
-                            local-field := Field { text <=> root.port-local; label: "Порт на компьютере"; placeholder: "Такой же"; enabled: root.confirm-kind == "" && !root.quitting; accepted => { description-field.focus-field(); } }
-                        }
-                    }
-                    Text { text: "Название"; color: Theme.ink; font-size: 12px; font-weight: 500; }
-                    description-field := Field { text <=> root.port-description; label: "Название порта"; placeholder: "Например, сайт или база данных"; enabled: root.confirm-kind == "" && !root.quitting; accepted => { root.add-port(root.port-local, root.port-remote, root.port-description); } }
-                    Text { text: root.connected ? "Подключим сразу и сохраним для «" + root.project-name + "»." : "Сохраним для «" + root.project-name + "». Подключим вместе с проектом."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
-                    Text { text: root.port-error; color: #b2534a; font-size: 12px; wrap: word-wrap; }
+                    ActionButton { text: "Открыть папку конфига"; icon: @image-url("icons/folder.svg"); clicked => { root.open-config(); } }
+                    ActionButton { text: "Перечитать конфиг"; icon: @image-url("icons/refresh.svg"); enabled: root.can-reload; clicked => { root.refresh-tasks(); root.settings-open = false; } }
+                    if !root.can-reload: Text { text: "Для перечитывания отключите все соединения."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                    if root.selected >= 0: ActionButton { text: "Журнал подключения"; icon: @image-url("icons/log.svg"); clicked => { root.settings-open = false; root.select-log(""); root.show-log = true; } }
+                    if root.can-hide-to-tray: ActionButton { text: "Свернуть в трей"; icon: @image-url("icons/tray.svg"); clicked => { root.settings-open = false; root.hide-to-tray(); } }
                     Rectangle { vertical-stretch: 1; }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Rectangle { horizontal-stretch: 1; }
-                        ActionButton { text: "Отмена"; clicked => { root.adding-port = false; } }
-                        ActionButton { text: "Добавить порт"; primary: true; clicked => { root.add-port(root.port-local, root.port-remote, root.port-description); } }
-                    }
+                    ActionButton { text: "Выйти из MakePort"; quiet: true; clicked => { root.settings-open = false; root.request-quit(); } }
                 }
-            }
             }
         }
         Rectangle {
@@ -592,14 +560,14 @@ export component MainWindow inherits Window {
                 background: Theme.surface; border-radius: 16px;
                 VerticalLayout {
                     padding: 28px; spacing: 16px;
-                    Heading { text: root.confirm-kind == "reset" ? "Задача уже завершена?" : root.confirm-kind == "delete" ? "Удалить проект из списка?" : "Остановить задачи?"; font-size: 21px; }
-                    Text { text: root.confirm-kind == "reset" ? "Проверьте процесс на сервере. Если задача завершена, подтвердите — её можно будет запустить снова." : root.confirm-kind == "delete" ? "Файлы и папка на сервере сохранятся." : root.confirm-kind == "quit" ? "Задачи во всех проектах будут остановлены, подключения закроются." : "Остановим задачи этого проекта и закроем его подключение."; color: Theme.muted; wrap: word-wrap; }
+                    Heading { text: root.confirm-kind == "reset" ? "Задача уже завершена?" : root.confirm-kind == "delete" ? "Удалить подключение?" : "Остановить задачи?"; font-size: 21px; }
+                    Text { text: root.confirm-kind == "reset" ? "Проверьте процесс на сервере. Если задача завершена, подтвердите — её можно будет запустить снова." : root.confirm-kind == "delete" ? "Удалится только сохранённое подключение." : root.confirm-kind == "quit" ? "Задачи будут остановлены, подключения закроются." : "Остановим задачи и отключим порты этого сервера."; color: Theme.muted; wrap: word-wrap; }
                     Rectangle { vertical-stretch: 1; }
                     HorizontalLayout {
                         spacing: 8px;
                         Rectangle { horizontal-stretch: 1; }
                         confirm-cancel := ActionButton { text: "Отмена"; clicked => { root.confirm-kind = ""; } }
-                        ActionButton { text: root.confirm-kind == "delete" ? "Удалить проект" : root.confirm-kind == "reset" ? "Задача завершена" : "Остановить"; primary: true; clicked => {
+                        ActionButton { text: root.confirm-kind == "delete" ? "Удалить подключение" : root.confirm-kind == "reset" ? "Задача завершена" : "Остановить"; primary: true; clicked => {
                             if root.confirm-kind == "reset" { root.reset-target(root.confirm-target); }
                             else if root.confirm-kind == "delete" { root.delete-project(); }
                             else if root.confirm-kind == "quit" { root.quit(); }

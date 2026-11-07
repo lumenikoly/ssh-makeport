@@ -23,7 +23,7 @@ else:
     pty = None
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = {name: (ROOT / "remote" / f"{name}.sh").read_text() for name in ("connect", "config", "discover", "task")}
+SCRIPTS = {name: (ROOT / "remote" / f"{name}.sh").read_text() for name in ("connect", "task")}
 TOKEN = "test-123"
 
 
@@ -107,24 +107,7 @@ class ShellTests(unittest.TestCase):
             result = subprocess.run(["/bin/sh", "-n"], input=script.encode(), capture_output=True)
             self.assertEqual(result.returncode, 0, (name, result.stderr))
 
-    def test_config_reads_literal_file_and_distinguishes_absence(self):
-        result = self.run_script("config", self.project, TOKEN)
-        self.assertEqual(result.returncode, 3)
-        text = b'[[tasks]]\ntarget="ok"\ndescription="Success"\n'
-        (self.project / "makeport.toml").write_bytes(text)
-        result = self.run_script("config", self.project, TOKEN)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, text)
-
-    def test_config_detects_large_file_and_bad_directory(self):
-        (self.project / "makeport.toml").write_bytes(b"x" * 70000)
-        result = self.run_script("config", self.project, TOKEN)
-        self.assertEqual(len(result.stdout), 65537)
-        result = self.run_script("config", self.project / "missing", TOKEN)
-        self.assertNotEqual(result.returncode, 3)
-        self.assertNotEqual(result.returncode, 0)
-
-    def test_connection_reports_ready_after_preflight(self):
+    def test_connection_reports_ready_without_project_preflight(self):
         result = self.run_script("connect", self.project, TOKEN)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"__MAKEPORT_READY_{TOKEN}__".encode(), result.stdout)
@@ -142,45 +125,10 @@ class ShellTests(unittest.TestCase):
                 proc.kill()
                 proc.wait()
 
-    def test_invalid_directory_never_reports_ready(self):
+    def test_forwarding_needs_no_project_directory_or_make(self):
         result = self.run_script("connect", self.root / "missing", TOKEN)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn(b"__MAKEPORT_READY_", result.stdout)
-
-    def test_relative_directory_is_rejected(self):
-        result = self.run_script("connect", "relative", TOKEN)
-        self.assertEqual(result.returncode, 64)
-
-    def test_home_expansion_is_explicit(self):
-        env = dict(os.environ, HOME=str(self.root))
-        project = self.root / "plain"
-        project.mkdir()
-        result = self.run_script("connect", "~/plain", TOKEN, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_discovery_reads_makefile_without_evaluating_it(self):
-        marker = self.root / "SHOULD_NOT_EXIST"
-        content = f"X := $(shell touch {shlex.quote(str(marker))})\nok: ## Success\n"
-        (self.project / "Makefile").write_text(content)
-        result = self.run_script("discover", self.project)
-        self.assertEqual(result.stdout.decode(), content)
-        self.assertFalse(marker.exists())
-
-    def test_discovery_uses_gnu_filename_precedence(self):
-        (self.project / "makefile").write_text("lower: ## Lower\n")
-        (self.project / "GNUmakefile").write_text("gnu: ## GNU\n")
-        result = self.run_script("discover", self.project)
-        self.assertEqual(result.stdout, b"gnu: ## GNU\n")
-
-    def test_discovery_size_is_bounded(self):
-        (self.project / "Makefile").write_bytes(b"x" * 400_000)
-        result = self.run_script("discover", self.project)
-        self.assertEqual(len(result.stdout), 262_145)
-
-    def test_missing_makefile_is_explicit(self):
-        (self.project / "Makefile").unlink()
-        result = self.run_script("discover", self.project)
-        self.assertEqual(result.returncode, 66)
+        self.assertIn(b"__MAKEPORT_READY_", result.stdout)
 
     def test_task_requires_a_real_pty(self):
         result = self.run_script("task", self.project, TOKEN, "ok")
@@ -220,10 +168,10 @@ class ShellTests(unittest.TestCase):
     def test_nested_remote_shell_quoting_is_literal(self):
         # Same single-quote strategy as shell::quote, including the outer login shell.
         quote = lambda value: "'" + value.replace("'", "'\\''") + "'"
-        command = f"sh -c {quote(SCRIPTS['discover'])} makeport {quote(str(self.project))}"
+        command = f"sh -c {quote(SCRIPTS['connect'])} makeport {quote(str(self.project))} {quote(TOKEN)}"
         result = subprocess.run(["/bin/sh", "-c", command], capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(b"ok: ## Success", result.stdout)
+        self.assertIn(b"__MAKEPORT_READY_", result.stdout)
 
 
 if __name__ == "__main__":

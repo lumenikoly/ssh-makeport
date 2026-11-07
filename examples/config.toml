@@ -1,19 +1,26 @@
 version = 1
-selected = "demo"
+selected = "dev"
 unconfirmed = []
 
 [[projects]]
-id = "demo"
-name = "Мой сайт"
+id = "dev"
+name = "Сервер разработки"
 host = "devbox"
-path = "~/projects/site"
+path = "~/projects/site" # Необязательно: только для задач Make
 reconnect = true
 tasks = ["dev", "test", "build"]
 
 [[projects.ports]]
 local = 5173
 remote = 5173
+description = "Сайт"
 
 [[projects.ports]]
 local = 15432
 remote = 5432
+description = "PostgreSQL"
+
+[[projects.ports]]
+local = 6379
+remote = 6379
+description = "Redis"

@@ -29,11 +29,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - name: Projects and manual ports
+      - name: Single config and batched ports
         run: cargo test --no-default-features --locked --test multi_project
       - name: Essential shell and release checks
         run: |
           python -m unittest discover -s tests -p 'test_release.py'
-          python -m unittest discover -s tests -p 'test_remote.py' -k 'test_config_reads_literal_file_and_distinguishes_absence' -k 'test_connection_stays_alive_until_stdin_eof' -k 'test_success_is_acknowledged' -k 'test_failure_is_acknowledged_with_nonzero_code' -k 'test_ctrl_c_reaches_make_and_its_child'
+          python -m unittest discover -s tests -p 'test_remote.py' -k 'test_forwarding_needs_no_project_directory_or_make' -k 'test_connection_stays_alive_until_stdin_eof' -k 'test_success_is_acknowledged' -k 'test_failure_is_acknowledged_with_nonzero_code' -k 'test_ctrl_c_reaches_make_and_its_child'
       - name: Check desktop application
         run: cargo clippy --bin makeport --locked -- -D warnings

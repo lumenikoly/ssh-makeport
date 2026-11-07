@@ -1,18 +1,12 @@
-use crate::model::{validate_target, Forward, Project};
+use crate::model::{validate_target, Project};
 use crate::Result;
 
-pub const CONFIG_SCRIPT: &str = include_str!("../remote/config.sh");
-
 pub const CONNECT_SCRIPT: &str = include_str!("../remote/connect.sh");
-pub const DISCOVER_SCRIPT: &str = include_str!("../remote/discover.sh");
 pub const TASK_SCRIPT: &str = include_str!("../remote/task.sh");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     Tunnel,
-    Port(Forward),
-    Config,
-    Discover,
     Task(String),
 }
 
@@ -33,9 +27,7 @@ pub fn exit_marker(token: &str) -> String {
 pub fn remote_command(project: &Project, role: &Role, token: &str) -> Result<String> {
     project.validate()?;
     let script = match role {
-        Role::Tunnel | Role::Port(_) => CONNECT_SCRIPT,
-        Role::Config => CONFIG_SCRIPT,
-        Role::Discover => DISCOVER_SCRIPT,
+        Role::Tunnel => CONNECT_SCRIPT,
         Role::Task(target) => {
             validate_target(target)?;
             TASK_SCRIPT
@@ -85,20 +77,8 @@ pub fn arguments(project: &Project, role: &Role, token: &str) -> Result<Vec<Stri
         Role::Tunnel => {
             args.extend(["-T".into(), "-o".into(), "ClearAllForwardings=no".into()]);
             for port in &project.ports {
-                args.extend(["-L".into(), port.argument()]);
+                args.extend(["-L".into(), port.forward().argument()]);
             }
-        }
-        Role::Port(port) => {
-            args.extend([
-                "-T".into(),
-                "-o".into(),
-                "ClearAllForwardings=no".into(),
-                "-L".into(),
-                port.argument(),
-            ]);
-        }
-        Role::Config | Role::Discover => {
-            args.extend(["-T".into(), "-o".into(), "ClearAllForwardings=yes".into()])
         }
         Role::Task(_) => args.extend(["-tt".into(), "-o".into(), "ClearAllForwardings=yes".into()]),
     }
@@ -110,7 +90,7 @@ pub fn arguments(project: &Project, role: &Role, token: &str) -> Result<Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Forward;
+    use crate::model::Port;
     fn project() -> Project {
         Project {
             manual_ports: Vec::new(),
@@ -118,7 +98,8 @@ mod tests {
             name: "test".into(),
             host: "dev".into(),
             path: "~/my ' project".into(),
-            ports: vec![Forward {
+            ports: vec![Port {
+                description: "Preview".into(),
                 local: 5173,
                 remote: 80,
             }],
@@ -146,8 +127,23 @@ mod tests {
         assert!(!args.contains(&"-L".into()));
     }
     #[test]
-    fn discovery_only_reads_a_file() {
-        assert!(!DISCOVER_SCRIPT.contains("make -"));
-        assert!(DISCOVER_SCRIPT.contains("head -c 262145"));
+    fn maximum_port_batch_fits_one_windows_command_line() {
+        let mut project = project();
+        project.ports = (3000..3256)
+            .map(|p| Port {
+                local: p,
+                remote: p,
+                description: String::new(),
+            })
+            .collect();
+        let args = arguments(&project, &Role::Tunnel, "test").unwrap();
+        assert_eq!(args.iter().filter(|a| *a == "-L").count(), 256);
+        assert!(
+            args.iter()
+                .map(|a| a.encode_utf16().count() + 3)
+                .sum::<usize>()
+                < 32000
+        );
+        assert!(!args.last().unwrap().contains("command -v make"));
     }
 }

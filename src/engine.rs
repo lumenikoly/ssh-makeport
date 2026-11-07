@@ -1,12 +1,10 @@
 use crate::log::LogBuffer;
-use crate::makefile::{self, Target};
 use crate::model::{
-    unique_id, validate_target, Config, Draft, Forward, ManualPort, Project, RunRecord, MAX_PORTS,
+    unique_id, validate_target, Config, Draft, Forward, Port, Project, RunRecord, MAX_PORTS,
     MAX_PROJECTS, MAX_RUNNING, MAX_TASKS,
 };
 use crate::platform;
 use crate::process::{IoEvent, Process, Stream};
-use crate::project_file::ProjectFile;
 use crate::shell::{self, Role};
 use crate::store::{config_directory, Store};
 use crate::Result;
@@ -17,12 +15,17 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+struct Target {
+    name: String,
+    description: String,
+}
+
 #[derive(Debug)]
 pub enum Action {
     Select(usize),
-    AddPort(ManualPort),
+    AddPort(Port),
+    AddPorts(Vec<Port>),
     RemovePort(u16),
-    RetryPort(u16),
     Save(Draft),
     SaveAndConnect(Draft),
     Delete,
@@ -92,10 +95,10 @@ pub struct View {
     pub projects: Vec<Project>,
     pub project_states: Vec<String>,
     pub can_add: bool,
+    pub can_reload: bool,
     pub total_running: usize,
     pub can_manage_ports: bool,
     pub port_states: Vec<String>,
-    pub port_manual: Vec<bool>,
     pub selected: Option<usize>,
     pub connection: String,
     pub connected: bool,
@@ -115,7 +118,6 @@ pub struct View {
     pub quitting: bool,
     pub quit_ready: bool,
     pub next_action: String,
-    pub discovering: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -164,7 +166,7 @@ fn connection_help(error: &str) -> String {
     } else if error.contains("make is not available") {
         "На сервере не найден Make. Попросите администратора установить его для запуска задач."
     } else if error.contains("Address already in use") || error.contains("cannot listen") {
-        "Адрес на этом компьютере занят другим приложением. Измените local в makeport.toml или освободите этот порт."
+        "Адрес на этом компьютере занят другим приложением. Измените локальный порт в настройках или освободите его."
     } else {
         "Не удалось подключиться. Проверьте интернет, VPN и доступность сервера, затем повторите подключение."
     };
@@ -189,7 +191,6 @@ pub fn start() -> Backend {
 }
 
 struct Session {
-    project_file: Option<ProjectFile>,
     tasks: Vec<Task>,
     log: LogBuffer,
     log_name: String,
@@ -201,13 +202,11 @@ struct Session {
     retries: u32,
     pending_task: Option<String>,
     notice: String,
-    port_errors: BTreeMap<u16, String>,
     notice_serial: u64,
 }
 impl Default for Session {
     fn default() -> Self {
         Self {
-            project_file: None,
             tasks: Vec::new(),
             log: LogBuffer::default(),
             log_name: String::new(),
@@ -219,7 +218,6 @@ impl Default for Session {
             retries: 0,
             pending_task: None,
             notice: String::new(),
-            port_errors: BTreeMap::new(),
             notice_serial: 0,
         }
     }
@@ -407,7 +405,6 @@ impl Engine {
     }
 
     fn seed_tasks(&mut self) {
-        self.project_file = None;
         self.tasks.clear();
         let project_id = self.project().map(|p| p.id.clone()).unwrap_or_default();
         let unconfirmed = self
@@ -452,23 +449,6 @@ impl Engine {
                 status: TaskStatus::Ready,
                 log: LogBuffer::default(),
             });
-        }
-    }
-
-    fn reconcile_targets(&mut self, targets: Vec<Target>) {
-        let manual = self.project().map(|p| p.tasks.clone()).unwrap_or_default();
-        // Keep ongoing or unconfirmed work visible even when its rule disappeared.
-        self.tasks.retain(|t| {
-            t.status.active()
-                || t.status == TaskStatus::Unknown
-                || manual.contains(&t.name)
-                || targets.iter().any(|new| new.name == t.name)
-        });
-        for target in targets {
-            self.add_target(target);
-        }
-        if !self.tasks.iter().any(|t| t.name == self.log_name) {
-            self.log_name.clear();
         }
     }
 
@@ -540,22 +520,8 @@ impl Engine {
                 }
             }
             Action::AddPort(port) => self.add_port(port)?,
+            Action::AddPorts(ports) => self.add_ports(ports)?,
             Action::RemovePort(local) => self.remove_port(local)?,
-            Action::RetryPort(local) => {
-                let port = self
-                    .project()
-                    .and_then(|p| p.manual_ports.iter().find(|p| p.local == local))
-                    .ok_or("Ручной порт не найден")?
-                    .forward();
-                if self.link != Link::Online {
-                    return Err("Сначала подключитесь к проекту".into());
-                }
-                self.notice.clear();
-                if let Err(error) = self.start_port(port) {
-                    self.port_errors.insert(local, error.clone());
-                    return Err(error);
-                }
-            }
             Action::DismissNotice => {
                 if !self.fatal {
                     self.notice.clear();
@@ -601,7 +567,16 @@ impl Engine {
                         if busy {
                             return Err("Нельзя менять настройки работающего проекта".into());
                         }
-                        project.manual_ports = config.projects[index].manual_ports.clone();
+                        // The compact editor changes mappings without losing their descriptions.
+                        for port in &mut project.ports {
+                            if let Some(old) = config.projects[index]
+                                .ports
+                                .iter()
+                                .find(|p| p.local == port.local && p.remote == port.remote)
+                            {
+                                port.description = old.description.clone();
+                            }
+                        }
                         project.validate()?;
                         config.projects[index] = project.clone();
                         index
@@ -658,7 +633,9 @@ impl Engine {
                 }
             }
             Action::OpenPort(port) => {
-                if self.port_state(port) != "Проброшен" {
+                if self.link != Link::Online
+                    || !self.effective_ports().iter().any(|p| p.local == port)
+                {
                     return Err("Этот туннель не подключён".into());
                 }
                 platform::open_port(port)?;
@@ -667,69 +644,34 @@ impl Engine {
         Ok(())
     }
 
-    fn configured_ports(&self) -> Vec<Forward> {
-        self.project_file
-            .as_ref()
-            .map(|f| f.forwards())
-            .unwrap_or_else(|| self.project().map(|p| p.ports.clone()).unwrap_or_default())
-    }
-
     fn effective_ports(&self) -> Vec<Forward> {
-        let mut ports = self.configured_ports();
-        if let Some(project) = self.project() {
-            ports.extend(project.manual_ports.iter().map(ManualPort::forward));
-        }
-        ports
+        self.project()
+            .map(|p| p.ports.iter().map(Port::forward).collect())
+            .unwrap_or_default()
     }
     fn port_descriptions(&self) -> Vec<String> {
-        let mut descriptions = self
-            .configured_ports()
-            .iter()
-            .enumerate()
-            .map(|(index, port)| {
-                self.project_file
-                    .as_ref()
-                    .and_then(|f| f.ports.get(index))
-                    .map(|p| p.description.clone())
-                    .unwrap_or_else(|| format!("Порт {}", port.remote))
+        self.project()
+            .map(|p| {
+                p.ports
+                    .iter()
+                    .map(|p| {
+                        if p.description.is_empty() {
+                            format!("Порт {}", p.remote)
+                        } else {
+                            p.description.clone()
+                        }
+                    })
+                    .collect()
             })
-            .collect::<Vec<_>>();
-        if let Some(project) = self.project() {
-            descriptions.extend(project.manual_ports.iter().map(|p| p.description.clone()));
-        }
-        descriptions
+            .unwrap_or_default()
     }
-    fn port_state(&self, local: u16) -> String {
-        if self.configured_ports().iter().any(|p| p.local == local) {
-            return match self.link {
-                Link::Online => "Проброшен",
-                Link::Failed => "Ошибка",
-                Link::Connecting | Link::Retrying => "Подключается…",
-                Link::Stopping => "Отключается…",
-                Link::Offline => "Не подключён",
-            }
-            .into();
-        }
-        if let Some(process) = self
-            .processes
-            .values()
-            .find(|p| matches!(&p.role, Role::Port(port) if port.local == local))
-        {
-            return if process.stopping_at.is_some() {
-                "Отключается…"
-            } else if process.ready {
-                "Проброшен"
-            } else {
-                "Подключается…"
-            }
-            .into();
-        }
-        if self.port_errors.contains_key(&local) {
-            "Ошибка"
-        } else if self.desired {
-            "Подключается…"
-        } else {
-            "Не подключён"
+    fn port_state(&self, _local: u16) -> String {
+        match self.link {
+            Link::Online => "Проброшен",
+            Link::Failed => "Ошибка",
+            Link::Connecting | Link::Retrying => "Подключается…",
+            Link::Stopping => "Отключается…",
+            Link::Offline => "Не подключён",
         }
         .into()
     }
@@ -738,26 +680,52 @@ impl Engine {
             let Some(project) = self.config.projects.iter().find(|p| &p.id == id) else {
                 continue;
             };
-            let configured = state
-                .project_file
-                .as_ref()
-                .map(|f| f.forwards())
-                .unwrap_or_else(|| project.ports.clone());
-            let reserved = state.desired
-                && (configured.iter().any(|p| p.local == local)
-                    || project.manual_ports.iter().any(|p| p.local == local));
-            let closing = state
-                .processes
-                .values()
-                .any(|p| matches!(&p.role, Role::Port(port) if port.local == local));
-            if reserved || closing {
+            let owns_tunnel =
+                state.desired || state.processes.values().any(|p| p.role == Role::Tunnel);
+            if owns_tunnel && project.ports.iter().any(|p| p.local == local) {
                 return Err(format!("Локальный порт {local} занят проектом «{}» ({}). Выберите другой локальный порт.", project.name, project.path));
             }
         }
         Ok(())
     }
-    fn add_port(&mut self, port: ManualPort) -> Result<()> {
-        port.validate()?;
+    fn add_port(&mut self, port: Port) -> Result<()> {
+        self.add_ports(vec![port])
+    }
+    fn add_ports(&mut self, ports: Vec<Port>) -> Result<()> {
+        self.can_edit_ports()?;
+        if ports.is_empty() {
+            return Err("Укажите хотя бы один порт".into());
+        }
+        if self.effective_ports().len() + ports.len() > MAX_PORTS {
+            return Err(format!("Допускается не более {MAX_PORTS} портов"));
+        }
+        for port in &ports {
+            port.validate()?;
+            if self.effective_ports().iter().any(|p| p.local == port.local) {
+                return Err(format!(
+                    "Локальный порт {} уже добавлен в это подключение",
+                    port.local
+                ));
+            }
+            self.check_other_port(port.local)?;
+        }
+        let index = self.selected.ok_or("Сначала добавьте подключение")?;
+        let mut config = self.config.clone();
+        config.projects[index].ports.extend(ports);
+        self.commit(config)?;
+        self.saved_generation += 1;
+        self.restart_tunnel()
+    }
+    fn remove_port(&mut self, local: u16) -> Result<()> {
+        self.can_edit_ports()?;
+        let index = self.selected.ok_or("Подключение не выбрано")?;
+        let mut config = self.config.clone();
+        config.projects[index].ports.retain(|p| p.local != local);
+        self.commit(config)?;
+        self.saved_generation += 1;
+        self.restart_tunnel()
+    }
+    fn can_edit_ports(&self) -> Result<()> {
         if self.fatal
             || self.closing.is_some()
             || matches!(
@@ -767,77 +735,20 @@ impl Engine {
         {
             return Err("Дождитесь завершения подключения".into());
         }
-        if self.effective_ports().len() >= MAX_PORTS {
-            return Err("В одном проекте допускается не более 32 портов".into());
-        }
-        if self.effective_ports().iter().any(|p| p.local == port.local) {
-            return Err(format!(
-                "Локальный порт {} уже добавлен в этот проект",
-                port.local
-            ));
-        }
-        if self
-            .processes
-            .values()
-            .any(|p| matches!(&p.role, Role::Port(p) if p.local == port.local))
-        {
-            return Err("Предыдущий туннель ещё закрывается".into());
-        }
-        self.check_other_port(port.local)?;
-        let reservation = TcpListener::bind(("127.0.0.1", port.local))
-            .map_err(|e| format!("Локальный порт {} занят или недоступен: {e}", port.local))?;
-        drop(reservation);
-        let index = self.selected.ok_or("Сначала откройте папку проекта")?;
-        let forward = port.forward();
-        let mut config = self.config.clone();
-        config.projects[index].manual_ports.push(port);
-        self.commit(config)?;
-        self.saved_generation += 1;
+        Ok(())
+    }
+    fn restart_tunnel(&mut self) -> Result<()> {
         self.notice.clear();
         if self.link == Link::Online {
-            if let Err(error) = self.start_port(forward.clone()) {
-                self.port_errors.insert(forward.local, error.clone());
-                self.notice(error);
+            // Only the forwarding session is replaced. Task PTYs remain owned and running.
+            for process in self.processes.values_mut() {
+                if process.role == Role::Tunnel {
+                    let _ = process.request_stop();
+                }
             }
+            self.link = Link::Retrying;
+            self.retry_at = Some(Instant::now());
         }
-        Ok(())
-    }
-    fn remove_port(&mut self, local: u16) -> Result<()> {
-        let index = self.selected.ok_or("Проект не выбран")?;
-        let mut config = self.config.clone();
-        if !config.projects[index]
-            .manual_ports
-            .iter()
-            .any(|p| p.local == local)
-        {
-            return Err("Этот порт задан в makeport.toml. Измените файл проекта.".into());
-        }
-        config.projects[index]
-            .manual_ports
-            .retain(|p| p.local != local);
-        self.commit(config)?;
-        self.port_errors.remove(&local);
-        for process in self.processes.values_mut() {
-            if matches!(&process.role, Role::Port(port) if port.local == local) {
-                let _ = process.request_stop();
-            }
-        }
-        Ok(())
-    }
-    fn start_port(&mut self, port: Forward) -> Result<()> {
-        if self
-            .processes
-            .values()
-            .any(|p| matches!(&p.role, Role::Port(p) if p.local == port.local))
-        {
-            return Ok(());
-        }
-        self.check_other_port(port.local)?;
-        let reservation = TcpListener::bind(("127.0.0.1", port.local))
-            .map_err(|e| format!("Локальный порт {} занят или недоступен: {e}", port.local))?;
-        drop(reservation);
-        self.port_errors.remove(&port.local);
-        self.spawn(Role::Port(port))?;
         Ok(())
     }
 
@@ -845,11 +756,10 @@ impl Engine {
         if self.fatal {
             return Err("Сначала исправьте ошибку настроек".into());
         }
-        let mut project = self
+        let project = self
             .project()
             .cloned()
             .ok_or("Добавьте и выберите проект")?;
-        project.ports = self.configured_ports();
         let executable = platform::ssh_executable()?;
         let token = unique_id();
         let args = shell::arguments(&project, &role, &token)?;
@@ -865,20 +775,11 @@ impl Engine {
         // An early diagnostic only. ssh's ExitOnForwardFailure is authoritative:
         // another process can take a port between this check and SSH binding it.
         let mut reservations = Vec::new();
-        for port in &self.configured_ports() {
-            if self
-                .project()
-                .is_some_and(|p| p.manual_ports.iter().any(|m| m.local == port.local))
-            {
-                return Err(format!(
-                    "Порт {} указан в makeport.toml и добавлен вручную. Удалите ручной порт.",
-                    port.local
-                ));
-            }
+        for port in &self.effective_ports() {
             self.check_other_port(port.local)?;
             reservations.push(TcpListener::bind(("127.0.0.1", port.local)).map_err(|e| {
                 format!(
-                    "Порт {} недоступен: {e}. Измените local в makeport.toml или освободите этот порт.",
+                    "Порт {} недоступен: {e}. Измените локальный порт в настройках или освободите его.",
                     port.local
                 )
             })?);
@@ -903,7 +804,7 @@ impl Engine {
         self.retries = 0;
         self.retry_at = None;
         self.link = Link::Connecting;
-        if let Err(error) = self.spawn(Role::Config) {
+        if let Err(error) = self.begin_tunnel() {
             self.desired = false;
             self.link = Link::Failed;
             return Err(error);
@@ -912,18 +813,50 @@ impl Engine {
     }
 
     fn refresh(&mut self) -> Result<()> {
-        if self.link != Link::Online {
-            return Err("Сначала подключитесь к серверу".into());
+        // Config is local and authoritative; no remote discovery or merging.
+        if !self.can_reload() {
+            return Err("Отключите все подключения перед перечитыванием config.toml".into());
         }
-        if self
-            .processes
-            .values()
-            .any(|p| matches!(p.role, Role::Config | Role::Discover))
-        {
-            return Ok(());
+        let mut config = self.store.as_ref().ok_or("Настройки недоступны")?.load()?;
+        // Runtime task records cannot be cleared by editing the settings file.
+        config.unconfirmed = self.config.unconfirmed.clone();
+        config.validate()?;
+        for run in &config.unconfirmed {
+            let old = self.config.projects.iter().find(|p| p.id == run.project_id);
+            let new = config.projects.iter().find(|p| p.id == run.project_id);
+            if old
+                .zip(new)
+                .is_some_and(|(old, new)| old.host != new.host || old.path != new.path)
+            {
+                return Err(
+                    "Сначала подтвердите завершение задач перед изменением сервера или папки"
+                        .into(),
+                );
+            }
         }
-        self.spawn(Role::Config)?;
+        self.commit(config)?;
+        self.sessions.clear();
+        self.session = Session::default();
+        self.selected = None;
+        if !self.config.projects.is_empty() {
+            let index = self
+                .config
+                .projects
+                .iter()
+                .position(|p| Some(&p.id) == self.config.selected.as_ref())
+                .unwrap_or(0);
+            self.activate(index)?;
+        }
+        self.saved_generation += 1;
         Ok(())
+    }
+
+    fn can_reload(&self) -> bool {
+        !self.fatal
+            && self.closing.is_none()
+            && !self.desired
+            && self.sessions.values().all(|s| !s.desired)
+            && self.all_processes_empty()
     }
 
     fn run_target(&mut self, target: String) -> Result<()> {
@@ -1023,8 +956,7 @@ impl Engine {
         }
         for process in self.processes.values_mut() {
             match process.role {
-                Role::Config | Role::Discover => process.terminate(),
-                Role::Tunnel | Role::Port(_) => {
+                Role::Tunnel => {
                     let _ = process.request_stop();
                 }
                 Role::Task(_) => {}
@@ -1039,17 +971,6 @@ impl Engine {
                 let Some(process) = self.processes.get_mut(&id) else {
                     return;
                 };
-                if matches!(process.role, Role::Config | Role::Discover)
-                    && matches!(stream, Stream::Stdout)
-                {
-                    let remaining = (262_145_usize).saturating_sub(process.capture.len());
-                    process
-                        .capture
-                        .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-                    process.capture_overflow |=
-                        process.capture.len() > 262_144 || bytes.len() > remaining;
-                    return;
-                }
                 (id, stream, process.decoders[stream.index()].feed(&bytes))
             }
             IoEvent::Closed(id, stream) => {
@@ -1084,14 +1005,6 @@ impl Engine {
         };
         let role = process.role.clone();
         if matches!(stream, Stream::Stdout) {
-            if let Role::Port(port) = &role {
-                if raw == shell::ready_marker(&process.token) {
-                    process.ready = true;
-                    self.port_errors.remove(&port.local);
-                    self.dirty = true;
-                    return;
-                }
-            }
             if role == Role::Tunnel && raw == shell::ready_marker(&process.token) {
                 process.ready = true;
                 self.link = Link::Online;
@@ -1100,26 +1013,6 @@ impl Engine {
                 self.log.push("[SSH] Подключено. Настроенные туннели подняты; доступность приложения проверяется отдельно.");
                 self.dirty = true;
                 if self.desired {
-                    let ports = self
-                        .project()
-                        .map(|p| {
-                            p.manual_ports
-                                .iter()
-                                .map(ManualPort::forward)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    for port in ports {
-                        if let Err(error) = self.start_port(port.clone()) {
-                            self.port_errors.insert(port.local, error.clone());
-                            self.notice(error);
-                        }
-                    }
-                    if self.project_file.is_none() {
-                        if let Err(error) = self.spawn(Role::Discover) {
-                            self.notice(error);
-                        }
-                    }
                     if let Some(target) = self.pending_task.take() {
                         if let Err(error) = self.run_target(target) {
                             self.notice(error);
@@ -1188,7 +1081,7 @@ impl Engine {
         self.dirty = true;
         match &process.role {
             Role::Tunnel => {
-                if !self.desired {
+                if !self.desired || process.stopping_at.is_some() {
                     return;
                 }
                 let error = process
@@ -1227,117 +1120,7 @@ impl Engine {
                     self.link = Link::Failed;
                     self.desired = false;
                     self.pending_task = None;
-                    for process in self.processes.values_mut() {
-                        if matches!(process.role, Role::Port(_)) {
-                            let _ = process.request_stop();
-                        }
-                    }
                     self.notice(connection_help(&error));
-                }
-            }
-            Role::Port(port) => {
-                if self.desired
-                    && self
-                        .project()
-                        .is_some_and(|p| p.manual_ports.iter().any(|m| m.local == port.local))
-                {
-                    let error = process
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "SSH-туннель закрылся".into());
-                    self.port_errors.insert(port.local, error.clone());
-                    self.notice(format!(
-                        "Порт {}: {error}. Нажмите «Повторить».",
-                        port.local
-                    ));
-                }
-            }
-            Role::Config => {
-                if !self.desired {
-                    return;
-                }
-                let result = if process.capture_overflow {
-                    Err("makeport.toml слишком большой".into())
-                } else if process.status.is_some_and(|s| s.success()) {
-                    std::str::from_utf8(&process.capture)
-                        .map_err(|_| "makeport.toml должен быть в UTF-8".to_string())
-                        .and_then(ProjectFile::parse)
-                        .map(Some)
-                } else if process.status.and_then(|s| s.code()) == Some(3) {
-                    Ok(None)
-                } else {
-                    Err(connection_help(
-                        process
-                            .error
-                            .as_deref()
-                            .unwrap_or("Не удалось прочитать makeport.toml"),
-                    ))
-                };
-                match result {
-                    Ok(file) => {
-                        let ports = file.as_ref().map(|f| f.forwards()).unwrap_or_else(|| {
-                            self.project().map(|p| p.ports.clone()).unwrap_or_default()
-                        });
-                        if self.link == Link::Online && ports != self.configured_ports() {
-                            self.notice("Порты в makeport.toml изменились. Отключитесь и подключитесь снова, чтобы применить их.");
-                            return;
-                        }
-                        if let Some(file) = &file {
-                            // Configured actions form the menu; preserve only ongoing or uncertain runs.
-                            self.tasks.retain(|t| {
-                                t.status.active()
-                                    || t.status == TaskStatus::Unknown
-                                    || file.tasks.iter().any(|a| a.target == t.name)
-                            });
-                            for task in &file.tasks {
-                                self.add_target(Target {
-                                    name: task.target.clone(),
-                                    description: task.description.clone(),
-                                });
-                            }
-                            self.log.push("[Проект] Загружен makeport.toml");
-                        }
-                        self.project_file = file;
-                        if !self.tasks.iter().any(|t| t.name == self.log_name) {
-                            self.log_name.clear();
-                        }
-                        if self.link != Link::Online {
-                            if let Err(error) = self.begin_tunnel() {
-                                self.desired = false;
-                                self.link = Link::Failed;
-                                self.notice(error);
-                            }
-                        } else if self.project_file.is_none() {
-                            if let Err(error) = self.spawn(Role::Discover) {
-                                self.notice(error);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        if self.link != Link::Online {
-                            self.desired = false;
-                            self.link = Link::Failed;
-                            self.pending_task = None;
-                        }
-                        self.notice(error);
-                    }
-                }
-            }
-            Role::Discover => {
-                if !self.desired {
-                    return;
-                }
-                if process.capture_overflow {
-                    self.notice(
-                        "Makefile больше 256 КиБ. Укажите нужные действия в makeport.toml.",
-                    );
-                } else if process.status.is_some_and(|s| s.success()) {
-                    let targets = makefile::discover(&String::from_utf8_lossy(&process.capture));
-                    let count = targets.len();
-                    self.reconcile_targets(targets);
-                    self.log.push(format!("[Makefile] Найдено целей: {count}. Комментарии ## имеют приоритет над .PHONY."));
-                } else {
-                    self.notice("В папке нет доступного Makefile. Добавьте makeport.toml с нужными действиями; подробности — в журнале подключения.");
                 }
             }
             Role::Task(name) => {
@@ -1384,13 +1167,10 @@ impl Engine {
         for (&id, process) in &mut self.processes {
             let connecting_too_long =
                 !process.ready && process.started_at.elapsed() > Duration::from_secs(30);
-            let discovering_too_long = matches!(process.role, Role::Config | Role::Discover)
-                && process.started_at.elapsed() > Duration::from_secs(20);
             let stopping_too_long = process
                 .stopping_at
                 .is_some_and(|at| at.elapsed() > Duration::from_secs(8));
-            if (connecting_too_long || discovering_too_long || stopping_too_long) && !process.forced
-            {
+            if (connecting_too_long || stopping_too_long) && !process.forced {
                 process.error = Some(
                     if stopping_too_long {
                         "Не получено подтверждение за 8 секунд; SSH закрывается"
@@ -1421,7 +1201,10 @@ impl Engine {
             self.link = Link::Offline;
             self.dirty = true;
         }
-        if self.desired && self.retry_at.is_some_and(|at| at <= now) {
+        if self.desired
+            && self.retry_at.is_some_and(|at| at <= now)
+            && !self.processes.values().any(|p| p.role == Role::Tunnel)
+        {
             self.retry_at = None;
             if let Err(error) = self.begin_tunnel() {
                 self.desired = false;
@@ -1434,10 +1217,6 @@ impl Engine {
 
     fn view(&self) -> View {
         let connected = self.link == Link::Online && self.desired;
-        let discovering = self
-            .processes
-            .values()
-            .any(|p| matches!(p.role, Role::Config | Role::Discover));
         let can_run = !self.fatal
             && self.closing.is_none()
             && (connected || (!self.desired && self.link != Link::Stopping));
@@ -1456,22 +1235,20 @@ impl Engine {
                 else { self.sessions.get(&project.id).map(Session::summary).unwrap_or_else(|| "Не подключён".into()) }
             }).collect(),
             can_add: !self.fatal && self.closing.is_none(),
+            can_reload: self.can_reload(),
             total_running: self.total_running(),
             can_manage_ports: !self.fatal && self.closing.is_none() && self.project().is_some() && !matches!(self.link, Link::Connecting | Link::Retrying | Link::Stopping),
             port_states: self.effective_ports().iter().map(|p| self.port_state(p.local)).collect(),
-            port_manual: std::iter::repeat_n(false, self.configured_ports().len()).chain(self.project().into_iter().flat_map(|p| p.manual_ports.iter().map(|_| true))).collect(),
             notice_serial: self.notice_serial,
-            discovering,
             next_action: if self.fatal { "Настройки недоступны. Подробности ошибки помогут восстановить доступ." }
-                else if self.project().is_none() { "Начните с добавления проекта. Вам понадобятся адрес сервера и папка проекта." }
+                else if self.project().is_none() { "Начните с добавления проекта. Укажите сервер и список портов." }
                 else if self.tasks.iter().any(|t| t.status == TaskStatus::Unknown) { "Не удалось подтвердить завершение задачи. Попросите администратора проверить её перед повторным запуском." }
-                else if self.link == Link::Connecting { "Проверяем сервер и папку проекта. Это может занять до 30 секунд. Подключение можно отменить." }
+                else if self.link == Link::Connecting { "Подключаем сервер и все настроенные порты. Это может занять до 30 секунд. Подключение можно отменить." }
                 else if self.link == Link::Retrying { "Связь прервалась. Восстанавливаем доступ; задачи повторно не запускаются." }
                 else if self.link == Link::Stopping { "Останавливаем задачи и закрываем подключение. Дождитесь завершения." }
-                else if discovering { "Получаем список задач из проекта…" }
                 else if self.tasks.iter().any(|t| t.status.active()) { "Задачи выполняются. Выберите «Подробности», чтобы посмотреть результат." }
-                else if connected { "Выберите задачу и нажмите «Запустить». После запуска сайта откройте его в разделе «Открыть приложение»." }
-                else { "Подключитесь, чтобы получить задачи проекта. Уже известную задачу можно запустить сразу." }.into(),
+                else if connected { "Все порты подключены через одно SSH-соединение." }
+                else { "Добавьте порты и подключитесь. Настройки хранятся в одном локальном config.toml." }.into(),
             projects: self.config.projects.clone(), selected: self.selected,
             connection: match self.link {
                 Link::Offline => "Не подключено", Link::Connecting => "Подключение…", Link::Online => "Подключено",
@@ -1555,71 +1332,5 @@ fn run(commands: Receiver<Action>, updates: SyncSender<View>) {
         if !receiver_alive && engine.closing.is_none() {
             let _ = engine.action(Action::Quit);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn refresh_removes_old_rules_but_preserves_manual_running_and_unknown_tasks() {
-        let project = Draft {
-            name: "Test".into(),
-            host: "devbox".into(),
-            path: "~/project".into(),
-            tasks: "manual".into(),
-            ..Draft::default()
-        }
-        .into_project()
-        .unwrap();
-        let (io_tx, _) = mpsc::sync_channel(16);
-        let mut engine = Engine {
-            session: Session {
-                notice: String::new(),
-                ..Session::default()
-            },
-            sessions: BTreeMap::new(),
-            config: Config {
-                projects: vec![project],
-                ..Config::default()
-            },
-            store: None,
-            directory: PathBuf::new(),
-            selected: Some(0),
-            io_tx,
-            next_process: 1,
-            closing: None,
-            fatal: false,
-            saved_generation: 0,
-            dirty: false,
-        };
-        for name in ["old", "manual", "running", "unknown"] {
-            engine.add_target(Target {
-                name: name.into(),
-                description: String::new(),
-            });
-        }
-        engine.task_mut("running").unwrap().status = TaskStatus::Running;
-        engine.task_mut("unknown").unwrap().status = TaskStatus::Unknown;
-        engine.reconcile_targets(vec![Target {
-            name: "new".into(),
-            description: "New task".into(),
-        }]);
-        let names = engine
-            .tasks
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(names, ["manual", "running", "unknown", "new"]);
-        assert!(engine.log_name.is_empty());
-        assert!(
-            !engine
-                .view()
-                .tasks
-                .iter()
-                .find(|t| t.name == "unknown")
-                .unwrap()
-                .can_run
-        );
     }
 }

@@ -1,9 +1,9 @@
 [package]
 name = "makeport"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "A small desktop launcher for remote Make tasks and SSH tunnels"
+description = "A simple desktop app for forwarding many ports over SSH"
 publish = false
 build = "build.rs"
 

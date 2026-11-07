@@ -2,7 +2,7 @@
 #![deny(unsafe_code)]
 
 use makeport::engine::{self, Action, View};
-use makeport::model::{unique_id, Draft, ManualPort};
+use makeport::model::{parse_ports, unique_id, Draft, Port};
 use slint::winit_030::WinitWindowAccessor;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
@@ -132,37 +132,6 @@ fn monitor_tray() -> (
     (status_rx, stop_tx, thread)
 }
 
-fn parse_manual_port(local: &str, remote: &str, description: &str) -> makeport::Result<ManualPort> {
-    let remote = remote
-        .trim()
-        .parse::<u16>()
-        .ok()
-        .filter(|p| *p != 0)
-        .ok_or("Укажите порт на сервере: от 1 до 65535")?;
-    let local = if local.trim().is_empty() {
-        remote
-    } else {
-        local
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .filter(|p| *p != 0)
-            .ok_or("Локальный порт: от 1 до 65535")?
-    };
-    let description = if description.trim().is_empty() {
-        format!("Порт {remote}")
-    } else {
-        description.trim().into()
-    };
-    let port = ManualPort {
-        local,
-        remote,
-        description,
-    };
-    port.validate()?;
-    Ok(port)
-}
-
 fn draft(ui: &MainWindow) -> Draft {
     let host = ui.get_edit_host().trim().to_owned();
     Draft {
@@ -223,11 +192,28 @@ fn edit(ui: &MainWindow, draft: Draft) {
     ui.set_edit_tasks(draft.tasks.into());
     ui.set_edit_reconnect(draft.reconnect);
     ui.set_edit_error("".into());
+    ui.set_edit_advanced(false);
     ui.set_editing(true);
     ui.invoke_focus_editor();
 }
 
 fn apply(ui: &MainWindow, view: &View, previous: &View) {
+    if view.selected != previous.selected {
+        ui.set_port_input("".into());
+        ui.set_port_error("".into());
+        ui.set_show_tasks(false);
+    }
+    if view.saved_generation != previous.saved_generation && view.ports.len() > previous.ports.len()
+    {
+        ui.set_port_input("".into());
+        ui.set_port_error("".into());
+    }
+    if view.tasks.iter().any(|task| task.unknown)
+        && (view.selected != previous.selected || !previous.tasks.iter().any(|task| task.unknown))
+    {
+        ui.set_show_tasks(true);
+    }
+
     // Keep models stable while only logs change. This preserves focus/scrolling.
     if view.projects != previous.projects || view.project_states != previous.project_states {
         ui.set_projects(ModelRc::new(VecModel::from(
@@ -273,19 +259,18 @@ fn apply(ui: &MainWindow, view: &View, previous: &View) {
     ui.set_desired(view.desired);
     ui.set_can_change(view.can_change);
     ui.set_can_add(view.can_add);
+    ui.set_can_reload(view.can_reload);
     ui.set_can_manage_ports(view.can_manage_ports);
     ui.set_total_running(view.total_running as i32);
     ui.set_can_connect(view.can_connect);
     ui.set_running(view.running as i32);
     ui.set_next_action(view.next_action.clone().into());
-    ui.set_discovering(view.discovering);
     ui.set_notice(view.notice.clone().into());
     ui.set_fatal(view.fatal);
     ui.set_quitting(view.quitting);
     if view.ports != previous.ports
         || view.port_descriptions != previous.port_descriptions
         || view.port_states != previous.port_states
-        || view.port_manual != previous.port_manual
         || view.selected != previous.selected
     {
         ui.set_ports(ModelRc::new(VecModel::from(
@@ -300,7 +285,6 @@ fn apply(ui: &MainWindow, view: &View, previous: &View) {
                         .cloned()
                         .unwrap_or_else(|| "Не подключён".into())
                         .into(),
-                    manual: view.port_manual.get(i).copied().unwrap_or(false),
                     can_open: view.port_states.get(i).is_some_and(|s| s == "Проброшен"),
                     mapping: format!("localhost:{}", p.local).into(),
                     remote: i32::from(p.remote),
@@ -324,13 +308,9 @@ fn apply(ui: &MainWindow, view: &View, previous: &View) {
     }
     if view.saved_generation != previous.saved_generation {
         ui.set_editing(false);
-        ui.set_adding_port(false);
     }
     if ui.get_editing() && view.notice_serial != previous.notice_serial {
         ui.set_edit_error(view.notice.clone().into());
-    }
-    if ui.get_adding_port() && view.notice_serial != previous.notice_serial {
-        ui.set_port_error(view.notice.clone().into());
     }
     if view.quit_ready {
         let _ = slint::quit_event_loop();
@@ -428,14 +408,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let weak = ui.as_weak();
         let tx = backend.actions.clone();
-        ui.on_add_port(move |local, remote, description| {
+        ui.on_add_ports(move |input| {
             if let Some(ui) = weak.upgrade() {
-                let parsed = parse_manual_port(&local, &remote, &description);
-                match parsed {
-                    Ok(port) => {
+                match parse_ports(&input) {
+                    Ok(ports) if !ports.is_empty() => {
                         ui.set_port_error("".into());
-                        send(&ui, &tx, Action::AddPort(port));
+                        send(
+                            &ui,
+                            &tx,
+                            Action::AddPorts(
+                                ports
+                                    .into_iter()
+                                    .map(|port| Port {
+                                        local: port.local,
+                                        remote: port.remote,
+                                        description: String::new(),
+                                    })
+                                    .collect(),
+                            ),
+                        );
                     }
+                    Ok(_) => ui.set_port_error("Укажите хотя бы один порт".into()),
                     Err(error) => ui.set_port_error(error.into()),
                 }
             }
@@ -447,15 +440,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.on_remove_port(move |local| {
             if let (Some(ui), Ok(local)) = (weak.upgrade(), u16::try_from(local)) {
                 send(&ui, &tx, Action::RemovePort(local));
-            }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let tx = backend.actions.clone();
-        ui.on_retry_port(move |local| {
-            if let (Some(ui), Ok(local)) = (weak.upgrade(), u16::try_from(local)) {
-                send(&ui, &tx, Action::RetryPort(local));
             }
         });
     }
@@ -654,23 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn manual_port_form_defaults_and_rejects_invalid_values() {
-        let port = parse_manual_port("", "5173", "").unwrap();
-        assert_eq!((port.local, port.remote), (5173, 5173));
-        assert_eq!(port.description, "Порт 5173");
-        assert_eq!(
-            parse_manual_port("15432", "5432", " Database ")
-                .unwrap()
-                .description,
-            "Database"
-        );
-        for (local, remote) in [("0", "5173"), ("", "65536"), ("-1", "80"), ("", "")] {
-            assert!(parse_manual_port(local, remote, "Test").is_err());
-        }
-        assert!(parse_manual_port("80", "80", "two\nlines").is_err());
-    }
-
-    #[test]
     fn folder_form_and_config_descriptions_reach_the_ui() {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
         window.set_size(slint::PhysicalSize::new(880, 660));
@@ -680,10 +647,23 @@ mod tests {
         let ui = MainWindow::new().unwrap();
         ui.show().unwrap();
         edit(&ui, Draft::default());
-        let mut pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(880, 660);
-        window.draw_if_needed(|renderer| {
-            renderer.render(pixels.make_mut_slice(), 880);
-        });
+        let capture = |name: &str| {
+            let mut pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(880, 660);
+            window.draw_if_needed(|renderer| {
+                renderer.render(pixels.make_mut_slice(), 880);
+            });
+            if let Some(directory) = std::env::var_os("MAKEPORT_TEST_SCREENSHOTS") {
+                std::fs::create_dir_all(&directory).unwrap();
+                let mut image = b"P6\n880 660\n255\n".to_vec();
+                image.extend_from_slice(pixels.as_bytes());
+                std::fs::write(
+                    std::path::Path::new(&directory).join(format!("{name}.ppm")),
+                    image,
+                )
+                .unwrap();
+            }
+        };
+        capture("connection-editor");
         ui.invoke_focus_editor();
         ui.invoke_copy_value("clipboard-check".into());
         assert_eq!(*clipboard.borrow(), "clipboard-check");
@@ -709,11 +689,24 @@ mod tests {
                 text: slint::platform::Key::Control.into(),
             });
         assert!(draft(&ui).into_project().is_err());
+        ui.set_edit_host("devbox".into());
+        ui.set_edit_ports("3000-3002, 15432:5432".into());
+        ui.set_edit_tasks("dev, test".into());
+        let forwarding = draft(&ui).into_project().unwrap();
+        assert_eq!(forwarding.path, "~");
+        assert_eq!(forwarding.ports.len(), 4);
+        assert_eq!(forwarding.tasks, ["dev", "test"]);
+        ui.set_edit_ports("".into());
+        ui.set_edit_tasks("".into());
         ui.set_edit_host("developer@devbox".into());
         ui.set_edit_path("~/projects/site".into());
         let project = draft(&ui).into_project().unwrap();
         assert_eq!(project.name, "site");
         edit(&ui, Draft::from(&project));
+        assert!(!ui.get_edit_advanced());
+        ui.set_edit_advanced(true);
+        capture("advanced-settings");
+        ui.set_edit_advanced(false);
         assert_eq!(draft(&ui).into_project().unwrap(), project);
         let view = View {
             projects: vec![project],
@@ -721,6 +714,13 @@ mod tests {
             total_running: 1,
             selected: Some(0),
             connected: true,
+            desired: true,
+            connection: "Подключено".into(),
+            running: 1,
+            can_add: true,
+            can_connect: true,
+            can_manage_ports: true,
+            port_states: vec!["Проброшен".into()],
             ports: vec![makeport::model::Forward {
                 local: 5173,
                 remote: 80,
@@ -751,7 +751,32 @@ mod tests {
             "Проектов подключено: 1 · Задач работает: 1"
         );
 
+        ui.set_editing(false);
+        assert!(!ui.get_show_tasks());
+        capture("ports-main");
+        ui.set_port_input("8000-8002".into());
+        let mut rejected = view.clone();
+        rejected.notice_serial += 1;
+        rejected.notice = "Порт занят".into();
+        apply(&ui, &rejected, &view);
+        assert_eq!(ui.get_port_input(), "8000-8002");
+        let mut saved = rejected.clone();
+        saved.saved_generation += 1;
+        saved.ports.push(makeport::model::Forward {
+            local: 8000,
+            remote: 8000,
+        });
+        apply(&ui, &saved, &rejected);
+        assert!(ui.get_port_input().is_empty());
+        let mut uncertain = saved.clone();
+        uncertain.tasks[0].unknown = true;
+        apply(&ui, &uncertain, &saved);
+        assert!(ui.get_show_tasks());
+        apply(&ui, &view, &uncertain);
         ui.set_can_hide_to_tray(true);
+        ui.set_settings_open(true);
+        capture("app-settings");
+        ui.set_settings_open(false);
         hide_to_tray(&ui);
         assert!(!ui.window().is_visible());
         assert_eq!(ui.get_tasks().row_data(0).unwrap().state, "Работает");

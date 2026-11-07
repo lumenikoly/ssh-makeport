@@ -47,8 +47,6 @@ pub struct Process {
     pub forced: bool,
     pub ready: bool,
     pub remote_exit: Option<i32>,
-    pub capture: Vec<u8>,
-    pub capture_overflow: bool,
     pub decoders: [LineDecoder; 2],
     pub filters: [AnsiFilter; 2],
     closed: [bool; 2],
@@ -71,7 +69,7 @@ impl Process {
         if let Err(error) = readers { let _ = child.kill(); let _ = child.wait(); return Err(error); }
         Ok(Self {
             id, role, token, child, input, started_at: Instant::now(), stopping_at: None,
-            forced: false, ready: false, remote_exit: None, capture: Vec::new(), capture_overflow: false,
+            forced: false, ready: false, remote_exit: None,
             decoders: Default::default(), filters: Default::default(), closed: [false; 2],
             status: None, exited_at: None, error: None,
         })

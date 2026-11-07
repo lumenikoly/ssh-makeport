@@ -1,16 +1,26 @@
-[[ports]]
+version = 1
+selected = "dev"
+unconfirmed = []
+
+[[projects]]
+id = "dev"
+name = "Сервер разработки"
+host = "devbox"
+path = "~/projects/site" # Необязательно: только для задач Make
+reconnect = true
+tasks = ["dev", "test", "build"]
+
+[[projects.ports]]
+local = 5173
 remote = 5173
-description = "Сайт для просмотра"
+description = "Сайт"
 
-[[ports]]
-remote = 5432
+[[projects.ports]]
 local = 15432
-description = "База данных"
+remote = 5432
+description = "PostgreSQL"
 
-[[tasks]]
-target = "dev"
-description = "Запустить сайт"
-
-[[tasks]]
-target = "test"
-description = "Проверить проект"
+[[projects.ports]]
+local = 6379
+remote = 6379
+description = "Redis"

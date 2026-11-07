@@ -1,5 +1,5 @@
 use makeport::engine::{self, Action, Backend, View};
-use makeport::model::{Config, Draft, ManualPort};
+use makeport::model::{Config, Draft, Port};
 use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -49,23 +49,22 @@ impl Drop for Harness {
         self.quit();
     }
 }
-fn manual(local: u16) -> ManualPort {
-    ManualPort {
+fn manual(local: u16) -> Port {
+    Port {
         local,
         remote: 3000,
         description: "Manual preview".into(),
     }
 }
-fn settings(local: u16, description: &str) -> String {
-    format!("[[ports]]\nremote=3000\nlocal={local}\ndescription='{description}'\n[[tasks]]\ntarget='dev'\ndescription='{description} dev'\n[[tasks]]\ntarget='unknown'\ndescription='Unknown task'\n")
-}
 #[test]
-fn simultaneous_projects_live_manual_ports_and_persistent_isolation() {
+fn one_config_batches_ports_and_preserves_independent_tasks() {
     let temp = tempfile::tempdir().unwrap();
     let remote = temp.path().join("remote");
     fs::create_dir_all(remote.join("a")).unwrap();
     fs::create_dir_all(remote.join("b")).unwrap();
-    let reservations = (0..4)
+    // A remote config must never be read, even when present and invalid.
+    fs::write(remote.join("a/makeport.toml"), "invalid = [").unwrap();
+    let reservations = (0..68)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())
         .collect::<Vec<_>>();
     let ports = reservations
@@ -73,8 +72,6 @@ fn simultaneous_projects_live_manual_ports_and_persistent_isolation() {
         .map(|p| p.local_addr().unwrap().port())
         .collect::<Vec<_>>();
     drop(reservations);
-    fs::write(remote.join("a/makeport.toml"), settings(ports[0], "A")).unwrap();
-    fs::write(remote.join("b/makeport.toml"), settings(ports[0], "B")).unwrap();
     let source = temp.path().join("ssh.rs");
     let ssh = temp
         .path()
@@ -98,124 +95,116 @@ fn simultaneous_projects_live_manual_ports_and_persistent_isolation() {
         name: "A".into(),
         host: "fake".into(),
         path: "/a".into(),
+        ports: ports[..64]
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        tasks: "dev, unknown".into(),
         ..Draft::default()
     }));
-    app.wait(|v| v.connected && v.tasks.iter().any(|t| t.title == "A dev"));
+    let v = app.wait(|v| v.connected);
+    assert_eq!(v.ports.len(), 64);
+    for port in &ports[..64] {
+        assert!(
+            TcpStream::connect(("127.0.0.1", *port)).is_ok(),
+            "Port {port} did not listen: {:?}",
+            TcpStream::connect(("127.0.0.1", *port))
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(remote.join("invocations")).unwrap(),
+        "tunnel:64\n"
+    );
     app.send(Action::Run("dev".into()));
     app.wait(|v| v.running == 1 && v.log_text.contains("TASK:/a:dev"));
-    app.send(Action::AddPort(manual(ports[2])));
-    app.wait(|v| v.ports.len() == 2 && v.port_states[1] == "Проброшен");
-    assert!(TcpStream::connect(("127.0.0.1", ports[2])).is_ok());
-    app.send(Action::RemovePort(ports[2]));
-    let v = app.wait(|v| v.ports.len() == 1);
+    app.send(Action::AddPorts(vec![manual(ports[65]), manual(ports[67])]));
+    let v = app.wait(|v| v.connected && v.ports.len() == 66);
     assert_eq!(v.running, 1);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpListener::bind(("127.0.0.1", ports[2])).is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Removing a live manual port must release its listener"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    fs::write(remote.join("fail-local"), ports[3].to_string()).unwrap();
-    app.send(Action::AddPort(manual(ports[3])));
-    let v = app.wait(|v| v.ports.len() == 2 && v.port_states[1] == "Ошибка");
+    assert!(TcpStream::connect(("127.0.0.1", ports[65])).is_ok());
+    assert!(TcpStream::connect(("127.0.0.1", ports[67])).is_ok());
+    assert_eq!(
+        fs::read_to_string(remote.join("invocations")).unwrap(),
+        "tunnel:64\ntask:0\ntunnel:66\n"
+    );
+    // One duplicate rejects the whole edit and leaves the current tunnel running.
+    app.send(Action::AddPorts(vec![manual(ports[66]), manual(ports[65])]));
+    let v = app.wait(|v| v.notice.contains("уже добавлен"));
+    assert_eq!(v.ports.len(), 66);
     assert!(v.connected);
+    app.send(Action::RemovePort(ports[65]));
+    let v = app.wait(|v| v.connected && v.ports.len() == 65);
     assert_eq!(v.running, 1);
+    assert!(TcpListener::bind(("127.0.0.1", ports[65])).is_ok());
+    app.send(Action::RemovePort(ports[67]));
+    app.wait(|v| v.connected && v.ports.len() == 64);
+    // A bind failure fails the entire batch rather than reporting partial success.
+    fs::write(remote.join("fail-local"), ports[66].to_string()).unwrap();
+    app.send(Action::AddPort(manual(ports[66])));
+    let v = app.wait(|v| v.connection == "Ошибка подключения");
+    assert_eq!(v.running, 1);
+    assert!(!v.connected);
+    assert!(v.port_states.iter().all(|s| s == "Ошибка"));
     fs::remove_file(remote.join("fail-local")).unwrap();
-    app.send(Action::RetryPort(ports[3]));
-    app.wait(|v| v.ports.len() == 2 && v.port_states[1] == "Проброшен");
-
-    app.send(Action::AddPort(manual(ports[3])));
-    let first = app.wait(|v| v.notice.contains("уже добавлен"));
-    app.send(Action::AddPort(manual(ports[3])));
-    let repeated = app.wait(|v| v.notice_serial > first.notice_serial);
-    assert_eq!(repeated.notice, first.notice);
-    assert_eq!(repeated.ports.len(), 2);
-
-    // Saving a second folder is permitted while the first one's task and ports are live.
+    app.send(Action::Connect);
+    app.wait(|v| v.connected && v.ports.len() == 65);
+    app.send(Action::AddPort(manual(ports[66])));
+    app.wait(|v| v.notice.contains("уже добавлен"));
     app.send(Action::SaveAndConnect(Draft {
         name: "B".into(),
         host: "fake".into(),
         path: "/b".into(),
+        ports: ports[0].to_string(),
+        tasks: "dev".into(),
         ..Draft::default()
     }));
     let v = app.wait(|v| v.selected == Some(1) && v.connection == "Ошибка подключения");
     assert!(v.notice.contains("занят проектом «A»"));
     assert_eq!(v.total_running, 1);
-    assert!(TcpStream::connect(("127.0.0.1", ports[3])).is_ok());
-    fs::write(remote.join("b/makeport.toml"), settings(ports[1], "B")).unwrap();
-    app.send(Action::Connect);
+    let mut draft = Draft::from(&v.projects[1]);
+    draft.ports = ports[64].to_string();
+    app.send(Action::SaveAndConnect(draft));
     app.wait(|v| v.selected == Some(1) && v.connected);
     app.send(Action::Run("dev".into()));
-    let v = app.wait(|v| v.total_running == 2 && v.log_text.contains("TASK:/b:dev"));
-    assert!(!v.log_text.contains("TASK:/a:dev"));
-    assert_eq!(v.port_descriptions, ["B"]);
-    app.send(Action::AddPort(manual(ports[3])));
-    let v = app.wait(|v| v.notice.contains("занят проектом «A»"));
-    assert_eq!(v.ports.len(), 1);
-    assert!(v.connected);
-
-    app.send(Action::Delete);
-    let v = app.wait(|v| v.notice.contains("Сначала отключитесь"));
-    assert_eq!(v.projects.len(), 2);
-    app.send(Action::Save(Draft {
-        name: "Idle folder".into(),
-        host: "fake".into(),
-        path: "/idle".into(),
-        ..Draft::default()
-    }));
-    let v = app.wait(|v| v.selected == Some(2));
-    assert_eq!(v.total_running, 2);
-    assert!(v.can_change);
-    app.send(Action::Delete);
-    let v = app.wait(|v| v.projects.len() == 2 && v.selected == Some(0));
-    assert_eq!(v.total_running, 2);
-
+    app.wait(|v| v.total_running == 2 && v.log_text.contains("TASK:/b:dev"));
     app.send(Action::Select(0));
     let v = app.wait(|v| v.selected == Some(0));
     assert_eq!(v.total_running, 2);
-    assert_eq!(v.running, 1);
     assert!(v.log_text.contains("TASK:/a:dev"));
-    assert_eq!(v.port_descriptions, ["A", "Manual preview"]);
     app.send(Action::Stop("dev".into()));
     app.wait(|v| v.running == 0 && v.total_running == 1);
     app.send(Action::Run("unknown".into()));
     app.wait(|v| v.tasks.iter().any(|t| t.name == "unknown" && t.unknown));
-    app.send(Action::Select(1));
-    let v = app.wait(|v| v.selected == Some(1));
-    assert_eq!(v.running, 1);
-    assert!(v.tasks.iter().all(|t| !t.unknown));
-    app.send(Action::Select(0));
-    app.wait(|v| v.selected == Some(0));
     app.send(Action::Disconnect);
-    app.wait(|v| !v.desired && v.connection == "Не подключено");
-    app.send(Action::Select(1));
-    let v = app.wait(|v| v.selected == Some(1));
-    assert!(v.connected);
-    assert_eq!(v.running, 1);
-    // Quit must stop the hidden B task even though A is selected.
-    app.send(Action::Select(0));
-    app.wait(|v| v.selected == Some(0));
+    app.wait(|v| v.connection == "Не подключено");
+    app.send(Action::Refresh);
+    app.wait(|v| v.notice.contains("Отключите все подключения"));
     app.quit();
-    assert!(TcpListener::bind(("127.0.0.1", ports[3])).is_ok());
-    assert!(TcpListener::bind(("127.0.0.1", ports[1])).is_ok());
-    let config: Config =
-        toml::from_str(&fs::read_to_string(config_dir.join("config.toml")).unwrap()).unwrap();
-    assert_eq!(config.projects.len(), 2);
-    assert_eq!(config.projects[0].manual_ports, [manual(ports[3])]);
+    for port in &ports {
+        assert!(TcpListener::bind(("127.0.0.1", *port)).is_ok());
+    }
+    let path = config_dir.join("config.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("manual_ports"));
+    let mut config: Config = toml::from_str(&text).unwrap();
+    assert_eq!(config.projects[0].ports.len(), 65);
+    assert_eq!(config.projects[0].ports[64], manual(ports[66]));
     assert_eq!(config.unconfirmed.len(), 1);
-    assert_eq!(config.unconfirmed[0].project_id, config.projects[0].id);
     let mut restarted = Harness(Some(engine::start()));
     let v = restarted.wait(|v| v.projects.len() == 2);
     assert!(v.tasks.iter().any(|t| t.name == "unknown" && t.unknown));
-    assert_eq!(v.ports[0].local, ports[3]);
-    restarted.send(Action::Select(1));
-    let v = restarted.wait(|v| v.selected == Some(1));
-    assert!(v.tasks.iter().all(|t| !t.unknown));
+    // Reload the single local config while offline, preserving unconfirmed runs.
+    config.projects[0].ports.pop();
+    config.unconfirmed.clear();
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    restarted.send(Action::Refresh);
+    let v = restarted.wait(|v| v.ports.len() == 64);
+    assert!(v.tasks.iter().any(|t| t.name == "unknown" && t.unknown));
+    fs::write(&path, "broken = [").unwrap();
+    restarted.send(Action::Refresh);
+    let v = restarted.wait(|v| v.notice.contains("Ошибка config.toml"));
+    assert_eq!(v.ports.len(), 64);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "broken = [");
     restarted.quit();
     std::env::remove_var("MAKEPORT_CONFIG_DIR");
     std::env::remove_var("MAKEPORT_SSH");

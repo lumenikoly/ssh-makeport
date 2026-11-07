@@ -8,7 +8,7 @@ fn main() {
             .set("ProductName", "MakePort")
             .set(
                 "FileDescription",
-                "MakePort — SSH projects, ports and Make tasks",
+                "MakePort — SSH port forwarding",
             )
             .compile()
             .expect("Не удалось добавить иконку Windows");

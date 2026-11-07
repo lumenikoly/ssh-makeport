@@ -12,21 +12,19 @@ fn main() {
     let path = parts[if task { 5 } else { 3 }];
     let directory = std::path::PathBuf::from(std::env::var_os("MAKEPORT_TEST_REMOTE").unwrap())
         .join(path.trim_start_matches('/'));
-    if command.contains("head -c 65537") {
-        match fs::read(directory.join("makeport.toml")) {
-            Ok(bytes) => std::io::stdout().write_all(&bytes).unwrap(),
-            Err(_) if directory.is_dir() => std::process::exit(3),
-            Err(_) => {
-                eprintln!("No such file: {path}");
-                std::process::exit(72);
-            }
-        }
-    } else if command.contains("head -c 262145") {
-        match fs::read(directory.join("Makefile")) {
-            Ok(bytes) => std::io::stdout().write_all(&bytes).unwrap(),
-            Err(_) => std::process::exit(66),
-        }
-    } else if task {
+    let kind = if task { "task" } else { "tunnel" };
+    let count = args.iter().filter(|a| *a == "-L").count();
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.parent().unwrap().join("invocations"))
+        .unwrap();
+    writeln!(log, "{kind}:{count}").unwrap();
+    assert!(
+        !command.contains("head -c"),
+        "Remote discovery is forbidden"
+    );
+    if task {
         let target = parts[1];
         println!("\n__MAKEPORT_STARTED_{token}__");
         println!("TASK:{path}:{target}");
