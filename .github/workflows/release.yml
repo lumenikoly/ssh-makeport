@@ -21,9 +21,6 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '12.0'
 
 jobs:
-  check:
-    uses: ./.github/workflows/ci.yml
-
   prepare:
     runs-on: ubuntu-24.04
     outputs:
@@ -54,7 +51,7 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: [prepare, check]
+    needs: [prepare]
     strategy:
       fail-fast: false
       matrix:

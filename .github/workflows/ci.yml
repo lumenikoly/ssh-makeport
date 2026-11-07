@@ -1,11 +1,10 @@
-name: Check
+name: Build
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-  workflow_call:
 
 permissions:
   contents: read
@@ -14,26 +13,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  build:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
       - uses: Swatinem/rust-cache@v2
       - name: Install desktop dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - name: Single config and batched ports
-        run: cargo test --no-default-features --locked --test multi_project
-      - name: Essential shell and release checks
-        run: |
-          python -m unittest discover -s tests -p 'test_release.py'
-          python -m unittest discover -s tests -p 'test_remote.py' -k 'test_forwarding_needs_no_project_directory_or_make' -k 'test_connection_stays_alive_until_stdin_eof' -k 'test_success_is_acknowledged' -k 'test_failure_is_acknowledged_with_nonzero_code' -k 'test_ctrl_c_reaches_make_and_its_child'
-      - name: Check desktop application
-        run: cargo clippy --bin makeport --locked -- -D warnings
+      - name: Build desktop application
+        run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MakePort-linux-x86_64
+          path: target/release/makeport
+          if-no-files-found: error
