@@ -15,6 +15,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,10 +27,9 @@ jobs:
     outputs:
       tag: ${{ steps.source.outputs.tag }}
       sha: ${{ steps.source.outputs.sha }}
+      linux-run-id: ${{ steps.linux.outputs.run-id }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -43,12 +43,22 @@ jobs:
           [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "Run releases from main." >&2; exit 1; }
           python scripts/release.py validate "$RELEASE_TAG"
           test -s "releases/$RELEASE_TAG.md" || { echo "Missing release notes for $RELEASE_TAG." >&2; exit 1; }
-          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG"; then
             echo "Tag $RELEASE_TAG already exists. Use a new version." >&2
             exit 1
+          else
+            status=$?
+            [[ "$status" == 2 ]] || exit "$status"
           fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Find existing Linux build for this commit
+        id: linux
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(python scripts/release.py find-linux-build)
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
 
   build:
     needs: [prepare]
@@ -74,17 +84,38 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.sha }}
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Download existing Linux build
+        id: download-linux
+        if: matrix.platform == 'linux' && needs.prepare.outputs.linux-run-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: MakePort-linux-x86_64
+          run-id: ${{ needs.prepare.outputs.linux-run-id }}
+          github-token: ${{ github.token }}
+          path: target/release
+      - name: Restore executable permission
+        id: reuse-linux
+        if: steps.download-linux.outcome == 'success'
+        continue-on-error: true
+        run: chmod +x target/release/makeport
+      - uses: dtolnay/rust-toolchain@1.98.1
+        if: steps.reuse-linux.outcome != 'success'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - uses: Swatinem/rust-cache@v2
+        if: steps.reuse-linux.outcome != 'success'
+        with:
+          shared-key: release-${{ runner.os }}-${{ runner.arch }}
+          cache-on-failure: true
       - name: Install Linux dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && steps.reuse-linux.outcome != 'success'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: Build desktop application
+        if: steps.reuse-linux.outcome != 'success'
         run: cargo build --release --locked
       - name: Sign macOS executable locally
         if: runner.os == 'macOS'
@@ -103,6 +134,8 @@ jobs:
           name: release-${{ matrix.platform }}-${{ matrix.arch }}
           path: release-assets/*
           if-no-files-found: error
+          compression-level: 1
+          retention-days: 3
 
   publish:
     needs: [prepare, build]

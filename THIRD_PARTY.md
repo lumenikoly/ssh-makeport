@@ -10,6 +10,7 @@
 | directories 6.0.0 | Папки ОС | MIT OR Apache-2.0 |
 | tempfile 3.23.0 | Атомарная запись | MIT OR Apache-2.0 |
 | fs2 0.4.3 | Блокировка экземпляра | MIT OR Apache-2.0 |
+| glob 0.3.4 | Маски файлов Include в SSH-конфигах | MIT OR Apache-2.0 |
 | winresource 0.1.31 | Иконка и сведения Windows EXE при сборке | MIT |
 | zbus 5.19.0 | Проверка доступности системного трея на Linux | MIT |
 

@@ -193,6 +193,9 @@ export component MainWindow inherits Window {
     in property <bool> edit-is-new;
     in-out property <string> edit-name;
     in-out property <string> edit-host;
+    in-out property <[string]> ssh-hosts;
+    in-out property <bool> ssh-loading: false;
+    in-out property <string> ssh-config-message;
     in-out property <string> edit-error;
     in-out property <string> edit-path;
     in-out property <string> edit-ports;
@@ -231,6 +234,12 @@ export component MainWindow inherits Window {
     callback scroll-log();
 
     public function focus-editor() { host-field.focus-field(); }
+    public function show-ssh-hosts() { ssh-picker.show(); }
+    public function use-ssh-host(host: string) {
+        root.edit-host = host;
+        ssh-picker.close();
+        ports-field.focus-field();
+    }
     changed confirm-kind => { if root.confirm-kind != "" { confirm-cancel.focus(); } }
     changed show-log => { if root.show-log { root.follow-log = true; root.scroll-log(); } }
     private property <string> copy-message;
@@ -470,7 +479,39 @@ export component MainWindow inherits Window {
                         VerticalLayout { spacing: 10px;
                             Text { text: "Сервер и порты — всё, что нужно для подключения."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
                             Text { text: "Сервер"; color: Theme.ink; font-size: 12px; font-weight: 500; }
-                            host-field := Field { text <=> root.edit-host; label: "Сервер"; placeholder: "devbox или user@server"; accepted => { ports-field.focus-field(); } }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                host-field := Field {
+                                    text <=> root.edit-host; label: "Сервер"; placeholder: "devbox или user@server";
+                                    accepted => { ports-field.focus-field(); }
+                                    ssh-picker := PopupWindow {
+                                        y: parent.height + 4px; width: parent.width;
+                                        height: min(260px, root.ssh-hosts.length * 38px + 16px);
+                                        Rectangle {
+                                            background: Theme.surface; border-width: 1px; border-color: Theme.line; border-radius: 8px; clip: true;
+                                            ScrollView {
+                                                x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
+                                                VerticalLayout {
+                                                    spacing: 2px;
+                                                    for host in root.ssh-hosts: ActionButton {
+                                                        text: host; min-width: 0px; quiet: true;
+                                                        accessible-name: "Использовать SSH-подключение " + host;
+                                                        clicked => { root.use-ssh-host(host); }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.ssh-hosts.length > 0: ActionButton {
+                                    text: "Из SSH"; icon: @image-url("icons/server.svg");
+                                    accessible-name: "Выбрать подключение из SSH-настроек";
+                                    enabled: !root.ssh-loading;
+                                    clicked => { root.show-ssh-hosts(); }
+                                }
+                            }
+                            if root.ssh-loading: Text { text: "Читаем SSH-настройки…"; color: Theme.muted; font-size: 12px; }
+                            if root.ssh-config-message != "": Text { text: root.ssh-config-message; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
                             Text { text: "Порты"; color: Theme.ink; font-size: 12px; font-weight: 500; }
                             ports-field := Field { text <=> root.edit-ports; label: "Порты"; placeholder: "3000, 15432:5432, 8000-8010"; accepted => { root.save-project(root.edit-is-new); } }
                             Text { text: "Формат: порт или локальный:серверный. Можно списком или диапазоном."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }

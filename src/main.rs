@@ -197,6 +197,34 @@ fn edit(ui: &MainWindow, draft: Draft) {
     ui.invoke_focus_editor();
 }
 
+fn refresh_ssh_hosts(ui: &MainWindow) {
+    if ui.get_ssh_loading() {
+        return;
+    }
+    ui.set_ssh_loading(true);
+    let weak = ui.as_weak();
+    if let Err(error) = std::thread::Builder::new()
+        .name("ssh-config-discovery".into())
+        .spawn(move || {
+            let discovery = makeport::ssh_config::discover();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_ssh_hosts(ModelRc::new(VecModel::from(
+                    discovery
+                        .hosts
+                        .into_iter()
+                        .map(SharedString::from)
+                        .collect::<Vec<_>>(),
+                )));
+                ui.set_ssh_config_message(discovery.warning.into());
+                ui.set_ssh_loading(false);
+            });
+        })
+    {
+        ui.set_ssh_loading(false);
+        ui.set_ssh_config_message(format!("Не удалось прочитать SSH-настройки: {error}").into());
+    }
+}
+
 fn apply(ui: &MainWindow, view: &View, previous: &View) {
     if view.selected != previous.selected {
         ui.set_port_input("".into());
@@ -321,7 +349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
     ui.set_can_hide_to_tray(cfg!(any(target_os = "windows", target_os = "macos")));
     #[cfg(target_os = "linux")]
-    let (tray_status, tray_stop, tray_thread) = monitor_tray();
+    let (tray_availability, tray_stop, tray_thread) = monitor_tray();
     ui.window().set_size(slint::LogicalSize::new(1020.0, 740.0));
     ui.set_mono_font(
         if cfg!(target_os = "macos") {
@@ -483,6 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tx = backend.actions.clone();
         ui.on_new_project(move || {
             if let Some(ui) = weak.upgrade() {
+                refresh_ssh_hosts(&ui);
                 send(&ui, &tx, Action::DismissNotice);
                 edit(
                     &ui,
@@ -500,6 +529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         ui.on_edit_project(move || {
             if let Some(ui) = weak.upgrade() {
+                refresh_ssh_hosts(&ui);
                 let view = state.borrow();
                 if let Some(project) = view.selected.and_then(|i| view.projects.get(i)) {
                     send(&ui, &tx, Action::DismissNotice);
@@ -554,7 +584,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
         let Some(ui) = weak.upgrade() else { return; };
         #[cfg(target_os = "linux")]
-        for available in tray_status.try_iter() {
+        for available in tray_availability.try_iter() {
             if !available && ui.get_can_hide_to_tray() && !ui.window().is_visible() {
                 show_window(&ui);
                 ui.set_notice("Системный трей недоступен. Окно восстановлено; подключения продолжают работать.".into());
@@ -646,6 +676,10 @@ mod tests {
             .unwrap();
         let ui = MainWindow::new().unwrap();
         ui.show().unwrap();
+        ui.set_ssh_hosts(ModelRc::new(VecModel::from(vec![
+            SharedString::from("devbox"),
+            SharedString::from("database"),
+        ])));
         edit(&ui, Draft::default());
         let capture = |name: &str| {
             let mut pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(880, 660);
@@ -664,6 +698,16 @@ mod tests {
             }
         };
         capture("connection-editor");
+        ui.set_edit_ports("15432:5432".into());
+        ui.set_edit_name("Custom name".into());
+        ui.invoke_show_ssh_hosts();
+        capture("ssh-host-picker");
+        ui.invoke_use_ssh_host("devbox".into());
+        assert_eq!(ui.get_edit_host(), "devbox");
+        assert_eq!(ui.get_edit_ports(), "15432:5432");
+        assert_eq!(ui.get_edit_name(), "Custom name");
+        assert!(ui.get_editing());
+        edit(&ui, Draft::default());
         ui.invoke_focus_editor();
         ui.invoke_copy_value("clipboard-check".into());
         assert_eq!(*clipboard.borrow(), "clipboard-check");

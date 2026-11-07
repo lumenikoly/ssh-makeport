@@ -3,14 +3,89 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from unittest.mock import patch
+from urllib.error import URLError
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("release", ROOT / "scripts" / "release.py")
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
+
+
+class BuildReuseTests(unittest.TestCase):
+    SHA = "a" * 40
+    RUN = {"id": 42, "head_sha": SHA, "head_branch": "main", "event": "push",
+           "status": "completed", "conclusion": "success"}
+    ARTIFACT = {"name": "MakePort-linux-x86_64", "expired": False}
+
+    def lookup(self, responses):
+        # Exercise real URL construction and decoding without network access.
+        with patch.object(release, "urlopen", side_effect=[
+            io.BytesIO(json.dumps(response).encode()) for response in responses
+        ]) as request:
+            result = release.find_linux_build("owner/repo", self.SHA, "test-token")
+        return result, request
+
+    def test_reuses_exact_successful_main_push_and_authenticates_requests(self):
+        result, request = self.lookup([
+            {"workflow_runs": [self.RUN]}, {"artifacts": [self.ARTIFACT]},
+        ])
+        self.assertEqual(result, "42")
+        url = request.call_args_list[0].args[0].full_url
+        self.assertIn(f"head_sha={self.SHA}", url)
+        self.assertIn("event=push", url)
+        self.assertEqual(request.call_args_list[0].args[0].get_header("Authorization"),
+                         "Bearer test-token")
+        self.assertNotIn("test-token", url)
+
+    def test_wrong_commit_branch_event_or_run_state_never_reuses_artifacts(self):
+        for field, value in [("head_sha", "b" * 40), ("head_branch", "feature"),
+                             ("event", "pull_request"), ("status", "in_progress"),
+                             ("conclusion", "failure"), ("id", "42\nrun-id=1")]:
+            with self.subTest(field=field):
+                result, request = self.lookup([{"workflow_runs": [{**self.RUN, field: value}]}])
+                self.assertEqual(result, "")
+                self.assertEqual(request.call_count, 1)
+
+    def test_expired_or_wrong_artifact_falls_back_to_fresh_build(self):
+        for artifact in [{**self.ARTIFACT, "expired": True},
+                         {**self.ARTIFACT, "name": "unrelated"},
+                         {"name": self.ARTIFACT["name"]}]:
+            with self.subTest(artifact=artifact):
+                result, _ = self.lookup([{"workflow_runs": [self.RUN]},
+                                         {"artifacts": [artifact]}])
+                self.assertEqual(result, "")
+
+    def test_tries_another_matching_run_if_first_artifact_is_missing(self):
+        result, _ = self.lookup([
+            {"workflow_runs": [self.RUN, {**self.RUN, "id": 41}]},
+            {"artifacts": []}, {"artifacts": [self.ARTIFACT]},
+        ])
+        self.assertEqual(result, "41")
+
+    def test_api_failure_falls_back_without_exposing_credentials(self):
+        diagnostic = io.StringIO()
+        with patch.object(release, "urlopen", side_effect=URLError("test-token")), redirect_stderr(diagnostic):
+            self.assertEqual(release.find_linux_build("owner/repo", self.SHA, "test-token"), "")
+        self.assertIn("building normally", diagnostic.getvalue())
+        self.assertNotIn("test-token", diagnostic.getvalue())
+
+    def test_no_completed_build_returns_empty_run_id(self):
+        result, request = self.lookup([{"workflow_runs": []}])
+        self.assertEqual(result, "")
+        self.assertEqual(request.call_count, 1)
+
+    def test_unexpected_api_response_falls_back_to_build(self):
+        for response in [{}, {"workflow_runs": None}, {"workflow_runs": [None]}]:
+            with self.subTest(response=response), redirect_stderr(io.StringIO()):
+                result, _ = self.lookup([response])
+                self.assertEqual(result, "")
 
 
 class ReleaseTests(unittest.TestCase):

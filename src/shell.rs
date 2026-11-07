@@ -14,6 +14,12 @@ pub fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn quote_script(script: &str) -> String {
+    // include_str! preserves checkout/editor line endings on Windows.
+    // Normalize before quoting: POSIX sh treats a trailing CR as part of `set` options.
+    quote(&script.replace("\r\n", "\n"))
+}
+
 pub fn ready_marker(token: &str) -> String {
     format!("__MAKEPORT_READY_{token}__")
 }
@@ -35,7 +41,7 @@ pub fn remote_command(project: &Project, role: &Role, token: &str) -> Result<Str
     };
     let mut command = format!(
         "sh -c {} makeport {} {}",
-        quote(script),
+        quote_script(script),
         quote(&project.path),
         quote(token)
     );
@@ -91,6 +97,20 @@ pub fn arguments(project: &Project, role: &Role, token: &str) -> Result<Vec<Stri
 mod tests {
     use super::*;
     use crate::model::Port;
+    #[test]
+    fn remote_scripts_accept_windows_and_unix_line_endings() {
+        for script in [CONNECT_SCRIPT, TASK_SCRIPT] {
+            let unix = script.replace("\r\n", "\n");
+            let windows = unix.replace('\n', "\r\n");
+            assert_eq!(quote_script(&windows), quote_script(&unix));
+            assert!(!quote_script(&windows).contains('\r'));
+        }
+        for role in [Role::Tunnel, Role::Task("dev".into())] {
+            assert!(!remote_command(&project(), &role, "test")
+                .unwrap()
+                .contains('\r'));
+        }
+    }
     fn project() -> Project {
         Project {
             manual_ports: Vec::new(),

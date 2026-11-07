@@ -22,6 +22,7 @@ toml = "=0.8.23"
 directories = "=6.0.0"
 tempfile = "=3.23.0"
 fs2 = "=0.4.3"
+glob = "=0.3.4"
 slint = { version = "=1.17.1", optional = true, default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "accessibility", "system-tray", "unstable-winit-030"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -35,5 +36,5 @@ winresource = { version = "=0.1.31", optional = true, default-features = false }
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+codegen-units = 16
 strip = true

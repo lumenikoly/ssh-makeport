@@ -2696,6 +2696,7 @@ version = "0.4.0"
 dependencies = [
  "directories",
  "fs2",
+ "glob",
  "serde",
  "slint",
  "slint-build",

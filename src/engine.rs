@@ -167,6 +167,8 @@ fn connection_help(error: &str) -> String {
         "На сервере не найден Make. Попросите администратора установить его для запуска задач."
     } else if error.contains("Address already in use") || error.contains("cannot listen") {
         "Адрес на этом компьютере занят другим приложением. Измените локальный порт в настройках или освободите его."
+    } else if error.contains("Illegal option") || error.contains("Syntax error") {
+        "Сервер не смог выполнить служебный скрипт MakePort. Проверьте версию MakePort и доступность POSIX sh на сервере."
     } else {
         "Не удалось подключиться. Проверьте интернет, VPN и доступность сервера, затем повторите подключение."
     };
